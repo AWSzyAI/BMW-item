@@ -118,6 +118,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--outdir", type=str, default="../output")
+    parser.add_argument("--outdir", type=str, default="./output")
     args = parser.parse_args()
     main(args)
