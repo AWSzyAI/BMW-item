@@ -27,31 +27,18 @@ def build_text(df):
     return (df["case_title"].fillna("") + " " + df["performed_work"].fillna("")).astype(str)
 
 def hit_at_k(y_true_idx: np.ndarray, y_proba: np.ndarray, k: int) -> float:
-    """
-    y_true_idx: shape (N,)  — 已经是 label encoder 之后的整数索引
-    y_proba   : shape (N, C)
-    返回: 命中率（float）
-    """
-    # 取每行 top-k 的类别索引（二维：N x k）
-    # 用 argsort(-proba) 更直观；若追求更快可用 argpartition
+    """计算 hit@k 命中率"""
     topk_idx = np.argsort(-y_proba, axis=1)[:, :k]
-    # 判断每行是否命中：真实索引是否在该行的 top-k 索引中
-    # 利用广播 (N,1) vs (N,k)
     hits = (topk_idx == y_true_idx.reshape(-1, 1)).any(axis=1)
     return float(hits.mean())
 
 def eval_split(model, le, X_text, y_raw, indices):
-    # 真实标签转成索引（1D）
     y_true = le.transform([y_raw[i] for i in indices])
     Xs = [X_text[i] for i in indices]
-
-    # 预测标签索引
     y_pred = model.predict(Xs)
-    if isinstance(y_pred[0], str):  # 兼容某些模型返回原始标签名
+    if isinstance(y_pred[0], str):
         y_pred = le.transform(y_pred)
     y_pred = np.asarray(y_pred)
-
-    # 概率
     y_proba = model.predict_proba(Xs)
 
     m = {}
@@ -62,11 +49,11 @@ def eval_split(model, le, X_text, y_raw, indices):
     m["prec_macro"] = precision_score(y_true, y_pred, average="macro", zero_division=0)
     m["rec_macro"] = recall_score(y_true, y_pred, average="macro", zero_division=0)
 
-    # logloss / AUC
     try:
         m["logloss"] = log_loss(y_true, y_proba, labels=np.arange(len(le.classes_)))
     except Exception:
         m["logloss"] = np.nan
+
     try:
         m["auc_macro"] = roc_auc_score(
             y_true, y_proba, multi_class="ovo", average="macro", labels=np.arange(len(le.classes_))
@@ -74,7 +61,6 @@ def eval_split(model, le, X_text, y_raw, indices):
     except Exception:
         m["auc_macro"] = np.nan
 
-    # hit@k
     for k in [1, 3, 5, 10]:
         m[f"hit@{k}"] = hit_at_k(y_true, y_proba, k)
     return m
@@ -99,7 +85,15 @@ def main(args):
         bundle = joblib.load(os.path.join(outdir, f"model_fold{k}.joblib"))
         model = bundle["model"]; le = bundle["label_encoder"]
 
-        for split_name in ["val", "test"]:
+        # 根据模式决定评估哪些 split
+        if args.mode == "clean":
+            split_names = ["val", "test"]
+        elif args.mode == "dirty":
+            split_names = ["train", "val", "test"]
+        else:
+            raise ValueError("mode 只能是 clean 或 dirty")
+
+        for split_name in split_names:
             m = eval_split(model, le, X_text, y_raw, fold[split_name])
             m["fold"] = k; m["split"] = split_name
             rows.append(m)
@@ -110,7 +104,8 @@ def main(args):
             )
 
     dfm = pd.DataFrame(rows)
-    out_path = os.path.join(outdir, "metrics_hitk.csv")
+    suffix = "_dirty" if args.mode == "dirty" else "_clean"
+    out_path = os.path.join(outdir, f"metrics_hitk{suffix}.csv")
     dfm.to_csv(out_path, index=False, encoding="utf-8-sig")
     print("\n总体平均：")
     print(dfm.groupby("split")[["acc","f1_macro","hit@1","hit@3","hit@5","hit@10"]].mean().round(3))
@@ -119,5 +114,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=str, default="./output")
+    parser.add_argument("--mode", type=str, default="clean", choices=["clean", "dirty"],
+                        help="评估模式：clean=val+test，dirty=train+val+test")
     args = parser.parse_args()
     main(args)
