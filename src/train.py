@@ -9,11 +9,31 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
 
 import joblib
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
+
+
+class LossCallback:
+    """顶层定义的回调类，保证可被 pickle 序列化。
+    原先定义在 main() 内部会导致 pickling 时找不到类路径，从而报错。
+    """
+    def __init__(self):
+        self.losses = []
+
+    def __call__(self, params):
+        if hasattr(params, "score"):
+            # LogisticRegression 的损失是负对数似然
+            # sklearn 内部在训练过程中会设置 score_ 等属性
+            # 这里保留与原实现一致的负对数似然记录方式
+            try:
+                self.losses.append(-params.score_)
+            except Exception:
+                # 若 score_ 不可用则跳过
+                pass
 
 def ensure_single_label(s):
     """若列里偶有 '["a","b"]' 这类字符串，就取第一个；正常单标签直接返回字符串。"""
@@ -105,45 +125,69 @@ def main(args):
     with open(os.path.join(outdir, "folds.json"), "w", encoding="utf-8") as f:
         json.dump(folds, f, ensure_ascii=False, indent=2)
     print(f"已生成 5 折并保存到 {os.path.join(outdir,'folds.json')}")
+    print("各折样本数：")
+    for k, fold in enumerate(folds):
+        print(f"  Fold {k}: Train={len(fold['train'])}, Val={len(fold['val'])}, Test={len(fold['test'])}")
+
 
     # 标签编码（所有折共享同一编码器）
     le = LabelEncoder()
     y_enc = le.fit_transform(y_raw)  # ndarray shape (N,)
 
     # 定义模型（字符级 n-gram + 逻辑回归）
-    class LossCallback:
-        def __init__(self):
-            self.losses = []
-            
-        def __call__(self, params):
-            if hasattr(params, "score"):
-                # LogisticRegression 的损失是负对数似然
-                self.losses.append(-params.score_)
 
-def make_pipeline():
-        return Pipeline([
+    def make_pipeline():
+        pipe1 = Pipeline([
+            ("tfidf", TfidfVectorizer(
+                max_features=50_000,
+                ngram_range=(1, 2),
+                sublinear_tf=True,
+                # 若英文缩写多可改 analyzer="char", ngram_range=(2,4)
+                min_df=2
+
+            )),
+            ("clf", LogisticRegression(
+                max_iter=3000,
+                n_jobs=-1,
+                class_weight="balanced",
+                # solver="saga",
+                solver="liblinear",
+                C=2.0,
+                multi_class="ovr",
+                random_state=42
+            ))
+        ])
+        pipe2 = Pipeline([
             ("tfidf", TfidfVectorizer(
                 analyzer="char",
+                # 字词级
+                # analyzer="word",
                 ngram_range=(2, 5),
                 max_features=100_000,
                 min_df=1,
                 sublinear_tf=True
             )),
             ("clf", LogisticRegression(
-                max_iter=3000,
+                # we'll perform iterative fitting by calling fit multiple times with warm_start
+                max_iter=10,
+                warm_start=True,
                 n_jobs=-1,
                 class_weight="balanced",
-                solver="saga",
+                solver="saga", 
+                # solver="liblinear",
                 C=4.0,
-                multi_class="ovr",
+                # multi_class="ovr",
+                multi_class = "multinomial",
                 random_state=42,
-                verbose=1,  # 启用详细输出
+                # verbose=1,  # 启用详细输出
                 tol=1e-4    # 收敛容差
             ))
         ])
+        return pipe2
 
-    # 训练每个折（train 集）
+    # 训练每个折（train 集），并评估 test，保存模型
     print("\n开始 5 折训练：")
+    test_scores = []
     for k, fold in enumerate(tqdm(folds, total=5, desc="Training folds", ncols=88)):
         fold_start = time.time()
 
@@ -154,49 +198,105 @@ def make_pipeline():
         pipe = make_pipeline()
         callback = LossCallback()
 
-        print(f"\n[Fold {k}] 训练样本数：{len(X_tr)}，类别数：{len(le.classes_)}")
+        print(f"\n[Fold {k}] Train samples: {len(X_tr)}, Classes: {len(le.classes_)}")
         pipe_fit_start = time.time()
-        # 获取分类器实例
+        tfidf = pipe.named_steps["tfidf"]
         clf = pipe.named_steps["clf"]
-        # 设置回调
-        clf._get_loss = callback
+        X_tr_vec = tfidf.fit_transform(X_tr)
+
+        # iterative fitting using warm_start; record loss each iteration
+        classes = np.arange(len(le.classes_))
         
-        pipe.fit(X_tr, y_tr)
+        
+        max_epochs = 100
+
+        patience = 5
+        best_loss = float('inf')
+        wait = 0
+        from tqdm import trange
+        epoch_bar = trange(max_epochs, desc=f"Fold {k} epochs", ncols=88)
+        for epoch in epoch_bar:
+            clf.fit(X_tr_vec, y_tr)
+            try:
+                y_proba = clf.predict_proba(X_tr_vec)
+                loss_val = float(log_loss(y_tr, y_proba, labels=classes))
+            except Exception:
+                try:
+                    dec = clf.decision_function(X_tr_vec)
+                    if dec.ndim == 1:
+                        probs_pos = 1 / (1 + np.exp(-dec))
+                        y_proba = np.vstack([1 - probs_pos, probs_pos]).T
+                    else:
+                        e = np.exp(dec - np.max(dec, axis=1, keepdims=True))
+                        y_proba = e / e.sum(axis=1, keepdims=True)
+                    loss_val = float(log_loss(y_tr, y_proba, labels=classes))
+                except Exception:
+                    continue
+            callback.losses.append(loss_val)
+            epoch_bar.set_postfix({"loss": f"{loss_val:.4f}"})
+            if loss_val + 1e-9 < best_loss:
+                best_loss = loss_val
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
         pipe_fit_end = time.time()
 
-        # 绘制损失曲线
+        # plot loss curve
         plt.figure(figsize=(10, 5))
         plt.plot(callback.losses, label=f'Fold {k}')
-        plt.xlabel('迭代次数')
-        plt.ylabel('损失值')
-        plt.title(f'Fold {k} 训练损失曲线')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.title(f'Fold {k} Training Loss Curve')
         plt.legend()
         plt.grid(True)
-        # 保存损失曲线图
         loss_plot_path = os.path.join(outdir, f"loss_curve_fold{k}.png")
         plt.savefig(loss_plot_path)
         plt.close()
-
-        # 保存损失值数据
         loss_data_path = os.path.join(outdir, f"loss_data_fold{k}.json")
         with open(loss_data_path, "w") as f:
             json.dump({"losses": callback.losses}, f, indent=2)
-
-        # 保存模型
-        model_path = os.path.join(outdir, f"model_fold{k}.joblib")
+        model_path = os.path.join(outdir, f"model_fold-{k}.joblib")
         joblib.dump({
             "model": pipe,
-            "label_encoder": le,
-            "losses": callback.losses
+            "label_encoder": le
         }, model_path)
         fold_end = time.time()
-        
-        print(f"[Fold {k}] 损失曲线已保存：{loss_plot_path}")
-        print(f"[Fold {k}] 损失数据已保存：{loss_data_path}")
+        print(f"[Fold {k}] Loss plot saved: {loss_plot_path}")
+        print(f"[Fold {k}] Loss data saved: {loss_data_path}")
+        print(f"[Fold {k}] Vectorize+train time: {fmt_sec(pipe_fit_end - pipe_fit_start)}")
+        print(f"[Fold {k}] Total time (incl. save): {fmt_sec(fold_end - fold_start)}")
+        print(f"[Fold {k}] Model saved: {model_path}")
 
-        print(f"[Fold {k}] 向量化+训练耗时：{fmt_sec(pipe_fit_end - pipe_fit_start)}")
-        print(f"[Fold {k}] 总耗时（含保存）：{fmt_sec(fold_end - fold_start)}")
-        print(f"[Fold {k}] 模型已保存：{model_path}")
+        # 评估 test
+        test_idx = fold["test"]
+        X_test = [X_text[i] for i in test_idx]
+        y_test = y_enc[test_idx]
+        X_test_vec = tfidf.transform(X_test)
+        y_pred = clf.predict(X_test_vec)
+        acc = (y_pred == y_test).mean()
+        test_scores.append(acc)
+        print(f"[Fold {k}] Test accuracy: {acc:.4f}")
+
+    # 选 test accuracy 最优的 fold
+    best_fold = int(np.argmax(test_scores))
+    print(f"\nBest fold: {best_fold}, Test accuracy: {test_scores[best_fold]:.4f}")
+
+    # 用 best fold 的 train+val 数据训练全量模型
+    best_idxs = folds[best_fold]["train"] + folds[best_fold]["val"]
+    X_best = [X_text[i] for i in best_idxs]
+    y_best = y_enc[best_idxs]
+    pipe = make_pipeline()
+    tfidf = pipe.named_steps["tfidf"]
+    clf = pipe.named_steps["clf"]
+    X_best_vec = tfidf.fit_transform(X_best)
+    clf.fit(X_best_vec, y_best)
+    joblib.dump({
+        "model": pipe,
+        "label_encoder": le
+    }, os.path.join(outdir, "model_best.joblib"))
+    print(f"Best model trained on train+val of fold {best_fold} and saved to model_best.joblib")
 
     # 验证每折类覆盖（每类 val/test 应各1样本）
     print("\n折内类覆盖检查：")

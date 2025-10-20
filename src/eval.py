@@ -1,5 +1,5 @@
-# eval.py
-import os, json, argparse, ast
+#!/usr/bin/env python3
+import os, json, argparse, ast, sys
 import numpy as np
 import pandas as pd
 import joblib
@@ -80,36 +80,34 @@ def main(args):
     with open(os.path.join(outdir, "folds.json"), "r", encoding="utf-8") as f:
         folds = json.load(f)
 
-    rows = []
+    # 加载最优模型
+    best_model_path = os.path.join(outdir, "model_best.joblib")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(f"Best model not found: {best_model_path}")
+    bundle = joblib.load(best_model_path)
+    model = bundle["model"]
+    le = bundle["label_encoder"]
+
+    # Evaluate best model on combined splits across all folds
+    all_splits = {"train": [], "val": [], "test": []}
     for k, fold in enumerate(folds):
-        bundle = joblib.load(os.path.join(outdir, f"model_fold{k}.joblib"))
-        model = bundle["model"]; le = bundle["label_encoder"]
+        for split_name in ["train", "val", "test"]:
+            all_splits[split_name].extend(fold[split_name])
 
-        # 根据模式决定评估哪些 split
-        if args.mode == "clean":
-            split_names = ["val", "test"]
-        elif args.mode == "dirty":
-            split_names = ["train", "val", "test"]
-        else:
-            raise ValueError("mode 只能是 clean 或 dirty")
+    results = {}
+    for split_name, idxs in all_splits.items():
+        if not idxs:
+            print(f"No indices for split {split_name}, skipping")
+            continue
+        m = eval_split(model, le, X_text, y_raw, idxs)
+        results[split_name] = m
+        print(f"[All {split_name}]\nacc={m['acc']:.3f} | f1_macro={m['f1_macro']:.3f} | hit@1={m['hit@1']:.3f} | hit@3={m['hit@3']:.3f} | hit@5={m['hit@5']:.3f} | hit@10={m['hit@10']:.3f}")
 
-        for split_name in split_names:
-            m = eval_split(model, le, X_text, y_raw, fold[split_name])
-            m["fold"] = k; m["split"] = split_name
-            rows.append(m)
-            print(
-                f"[Fold {k}][{split_name}] "
-                f"acc={m['acc']:.3f} | f1_macro={m['f1_macro']:.3f} | "
-                f"hit@1={m['hit@1']:.3f} | hit@3={m['hit@3']:.3f} | hit@5={m['hit@5']:.3f} | hit@10={m['hit@10']:.3f}"
-            )
-
-    dfm = pd.DataFrame(rows)
-    suffix = "_dirty" if args.mode == "dirty" else "_clean"
-    out_path = os.path.join(outdir, f"metrics_hitk{suffix}.csv")
+    # Save results
+    dfm = pd.DataFrame([dict(split=split_name, **metrics) for split_name, metrics in results.items()])
+    out_path = os.path.join(outdir, "metrics_best_model_all_splits.csv")
     dfm.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print("\n总体平均：")
-    print(dfm.groupby("split")[["acc","f1_macro","hit@1","hit@3","hit@5","hit@10"]].mean().round(3))
-    print(f"\n明细保存到 {out_path}")
+    print(f"\nBest model metrics (all splits) saved to {out_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

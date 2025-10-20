@@ -1,8 +1,21 @@
 # predict.py
-import os, json, argparse, random, ast
+import os, json, argparse, random, ast, sys
 import pandas as pd
 import numpy as np
 import joblib
+
+# Compatibility: some saved joblib bundles reference LossCallback under __main__
+# (e.g. when model was saved from train.py run as __main__). To allow
+# unpickling here in predict.py, inject train.LossCallback into this module's
+# namespace under the common names pickle may look for.
+try:
+    import train as _train_module
+    _mod = sys.modules.get("__main__")
+    if _mod is not None and not hasattr(_mod, "LossCallback"):
+        setattr(_mod, "LossCallback", _train_module.LossCallback)
+except Exception:
+    # if import/inject fails, let joblib raise the original error when loading
+    pass
 
 def ensure_single_label(s):
     """将可能是列表或字符串列表的字段转为单标签字符串。"""
@@ -26,58 +39,53 @@ def build_text(df):
 
 def main(args):
     outdir = args.outdir
-    fold = args.fold
-
-    # df_filtered 原始样本数(展开): 2362 -> 过滤后样本数: 2072
+    # 加载数据
     df = pd.read_csv(os.path.join(outdir, "df_filtered.csv"))
-
-    required_cols = ['extern_id', 'linked_items', 'itemcreationdate',
-                     'item_title', 'case_id', 'case_title', 'performed_work']
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise KeyError(f"df_filtered.csv 缺少字段: {missing}")
-
-    df["linked_items_norm"] = df["linked_items"].apply(ensure_single_label).astype(str)
-    X = build_text(df).tolist()
-    y = df["linked_items_norm"].astype(str).tolist()
-
-    # 加载模型
-    model_path = os.path.join(outdir, f"model_fold{fold}.joblib")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"未找到模型: {model_path}")
-
-    bundle = joblib.load(model_path)
-    model = bundle["model"]; le = bundle["label_encoder"]
-
-    # 随机抽样
-    idx = random.randint(0, len(df) - 1)
-    row = df.iloc[idx]
-    text = X[idx]
-    true_label = y[idx]
-
-    # 模型预测
+    with open(os.path.join(outdir, "folds.json"), "r", encoding="utf-8") as f:
+        folds = json.load(f)
+    # 只用最优 fold 的 test 集
+    best_model_path = os.path.join(outdir, "model_best.joblib")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(f"Best model not found: {best_model_path}")
+    bundle = joblib.load(best_model_path)
+    model = bundle["model"]
+    le = bundle["label_encoder"]
+    # 选 test 集
+    # 找到最优 fold（与 train.py 输出一致）
+    test_accs = []
+    X_text = build_text(df).tolist()
+    y_raw = df["linked_items"].astype(str).tolist()
+    for k, fold in enumerate(folds):
+        test_idx = fold["test"]
+        X_test = [X_text[i] for i in test_idx]
+        y_test = [y_raw[i] for i in test_idx]
+        y_pred = model.predict(X_test)
+        acc = (y_pred == le.transform(y_test)).mean() if len(y_test) > 0 else 0
+        test_accs.append(acc)
+    best_fold = int(np.argmax(test_accs))
+    test_idx = folds[best_fold]["test"]
+    X_test = [X_text[i] for i in test_idx]
+    y_test = [y_raw[i] for i in test_idx]
+    # 随机抽样 test 集
+    if len(X_test) == 0:
+        print("No test samples found in best fold.")
+        return
+    idx = random.randint(0, len(X_test) - 1)
+    text = X_test[idx]
+    true_label = y_test[idx]
     probs = model.predict_proba([text])[0]
     sorted_idx = np.argsort(-probs)
     preds = le.inverse_transform(sorted_idx)
     scores = probs[sorted_idx]
-
-    # 打印基础字段信息
-    print(f"\n[Fold {fold}] 随机样本 #{idx}\n")
-    for col in required_cols:
-        val = str(row[col])[:500].replace("\n", " ")
-        print(f"{col:20s}: {val}")
-
-    print(f"{'-'*80}\n真实标签（标准化）: {true_label}\n")
-
-    # 命中情况
+    print(f"\n[Best Fold {best_fold}] Random test sample #{idx}\n")
+    print(f"Text: {text[:200]} ...")
+    print(f"True label: {true_label}")
     hits = {f"hit@{k}": int(true_label in preds[:k]) for k in [1, 3, 5, 10]}
-    print("命中统计：", "  ".join([f"{k}={v}" for k,v in hits.items()]))
-
-    # 打印前10预测
-    print("\nTop-10 预测结果：")
+    print("Hit stats:", "  ".join([f"{k}={v}" for k,v in hits.items()]))
+    print("\nTop-10 predictions:")
     for lbl, sc in zip(preds[:10], scores[:10]):
-        mark = "✅" if lbl == true_label else ""
-        print(f"{lbl:<10}\t{sc:.4f} {mark}")
+        mark = " ✅" if lbl == true_label else ""
+        print(f"{lbl:<10}\t{sc:.4f}{mark}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

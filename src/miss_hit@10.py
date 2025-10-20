@@ -1,8 +1,18 @@
 # inspect_miss_hit10.py
-import os, json, argparse, ast
+import os, json, argparse, ast, sys
 import numpy as np
 import pandas as pd
 import joblib
+
+# Compatibility for loading older joblib model bundles that referenced
+# LossCallback under __main__ (e.g. when model was saved from train.py as __main__).
+try:
+    import train as _train_module
+    _mod = sys.modules.get("__main__")
+    if _mod is not None and not hasattr(_mod, "LossCallback"):
+        setattr(_mod, "LossCallback", _train_module.LossCallback)
+except Exception:
+    pass
 
 def ensure_single_label(s):
     if isinstance(s, list):
@@ -92,8 +102,8 @@ def main(args):
     miss_df = pd.DataFrame(miss_rows)
     save_path = os.path.join(outdir, "miss_hit10_samples.csv")
     miss_df.to_csv(save_path, index=False, encoding="utf-8-sig")
-    print(f"已保存 hit@10=0 的样本到：{save_path}")
-    print(f"总计条数：{len(miss_df)}（val+test across all folds）")
+    print(f"Saved hit@10=0 samples to: {save_path}")
+    print(f"Total rows: {len(miss_df)} (val+test across all folds)")
 
 if __name__ == "__main__":
     import argparse
