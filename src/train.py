@@ -1,13 +1,16 @@
 # train.py
-import os, json, ast, argparse, warnings
+import os, json, ast, argparse, warnings, time
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+
 import joblib
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -28,6 +31,7 @@ def ensure_single_label(s):
     return str(s)
 
 def build_text(df):
+    """将 case_title + performed_work 合并为输入文本"""
     return (df["case_title"].fillna("") + " " + df["performed_work"].fillna("")).astype(str)
 
 def make_5fold_val_test_one_per_class(y):
@@ -38,6 +42,7 @@ def make_5fold_val_test_one_per_class(y):
     要求：每类样本数 m >= 2（建议 >=5 更稳）
     返回：folds = [{"train": [...], "val": [...], "test": [...]}, ...] (len=5)
     """
+    from collections import defaultdict
     label_to_idxs = defaultdict(list)
     for idx, lbl in enumerate(y):
         label_to_idxs[lbl].append(idx)
@@ -47,7 +52,7 @@ def make_5fold_val_test_one_per_class(y):
         if len(idxs) < 2:
             raise ValueError(f"类别 {lbl} 只有 {len(idxs)} 条，无法保证 val/test 各1条。请先过滤该类或合并类别。")
 
-    # 打乱每个类索引
+    # 打乱每个类索引（固定随机种子）
     rng = np.random.RandomState(42)
     for lbl in label_to_idxs:
         rng.shuffle(label_to_idxs[lbl])
@@ -55,7 +60,7 @@ def make_5fold_val_test_one_per_class(y):
     folds = []
     for k in range(5):
         tr, va, te = [], [], []
-        for lbl, idxs in label_to_idxs.items():
+        for _, idxs in label_to_idxs.items():
             m = len(idxs)
             v = idxs[k % m]
             t = idxs[(k + 1) % m]
@@ -68,69 +73,97 @@ def make_5fold_val_test_one_per_class(y):
         folds.append({"train": sorted(tr), "val": sorted(va), "test": sorted(te)})
     return folds
 
+def fmt_sec(sec: float) -> str:
+    """将秒格式化为 H:MM:SS"""
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
 def main(args):
+    global_start = time.time()
+    print("=== 模型训练开始 ===")
+
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
+    # 读取数据
     df = pd.read_csv(os.path.join(outdir, "df_filtered.csv"))
-    # 关键列检查
     for col in ["case_title", "performed_work", "linked_items"]:
         if col not in df.columns:
             raise KeyError(f"df_filtered.csv 缺少列：{col}")
 
-    # 单标签 & 文本
+    # 单标签标准化 & 文本构建
     df["linked_items"] = df["linked_items"].apply(ensure_single_label).astype(str)
     X_text = build_text(df).tolist()
     y_raw  = df["linked_items"].astype(str).tolist()
 
-    # 生成 5 折：每类 val/test 各1样本，其余 train
+    # 生成 5 折（每类 val/test 各1样本，其余 train）
     folds = make_5fold_val_test_one_per_class(y_raw)
     with open(os.path.join(outdir, "folds.json"), "w", encoding="utf-8") as f:
         json.dump(folds, f, ensure_ascii=False, indent=2)
     print(f"已生成 5 折并保存到 {os.path.join(outdir,'folds.json')}")
 
-    # 统一标签编码（所有折共享）
+    # 标签编码（所有折共享同一编码器）
     le = LabelEncoder()
-    y_enc = le.fit_transform(y_raw)
+    y_enc = le.fit_transform(y_raw)  # ndarray shape (N,)
 
-    # 训练每个折（用该折的 train）
-    for k, fold in enumerate(folds):
-        tr_idx = fold["train"]
-        X_tr = [X_text[i] for i in tr_idx]
-        y_tr = y_enc[tr_idx]
-
-        pipe = Pipeline([
+    # 定义模型（字符级 n-gram + 逻辑回归）
+    def make_pipeline():
+        return Pipeline([
             ("tfidf", TfidfVectorizer(
+                analyzer="char",
+                ngram_range=(2, 5),
                 max_features=100_000,
-                ngram_range=(1, 2),
+                min_df=1,
                 sublinear_tf=True
-                # 若英文缩写多可改 analyzer="char", ngram_range=(2,4)
             )),
             ("clf", LogisticRegression(
                 max_iter=3000,
                 n_jobs=-1,
                 class_weight="balanced",
                 solver="saga",
-                C=2.0,
+                C=4.0,
                 multi_class="ovr",
                 random_state=42
             ))
         ])
 
-        print(f"[Fold {k}] 训练样本数：{len(X_tr)}，类别数：{len(le.classes_)}")
-        pipe.fit(X_tr, y_tr)
+    # 训练每个折（train 集）
+    print("\n开始 5 折训练：")
+    for k, fold in enumerate(tqdm(folds, total=5, desc="Training folds", ncols=88)):
+        fold_start = time.time()
 
-        joblib.dump(
-            {"model": pipe, "label_encoder": le},
-            os.path.join(outdir, f"model_fold{k}.joblib")
-        )
-        print(f"[Fold {k}] 模型已保存：{os.path.join(outdir, f'model_fold{k}.joblib')}")
+        tr_idx = fold["train"]
+        X_tr = [X_text[i] for i in tr_idx]
+        y_tr = y_enc[tr_idx]
+
+        pipe = make_pipeline()
+
+        print(f"\n[Fold {k}] 训练样本数：{len(X_tr)}，类别数：{len(le.classes_)}")
+        pipe_fit_start = time.time()
+        pipe.fit(X_tr, y_tr)
+        pipe_fit_end = time.time()
+
+        # 保存模型
+        model_path = os.path.join(outdir, f"model_fold{k}.joblib")
+        joblib.dump({"model": pipe, "label_encoder": le}, model_path)
+        fold_end = time.time()
+
+        print(f"[Fold {k}] 向量化+训练耗时：{fmt_sec(pipe_fit_end - pipe_fit_start)}")
+        print(f"[Fold {k}] 总耗时（含保存）：{fmt_sec(fold_end - fold_start)}")
+        print(f"[Fold {k}] 模型已保存：{model_path}")
 
     # 验证每折类覆盖（每类 val/test 应各1样本）
+    print("\n折内类覆盖检查：")
     for k, fold in enumerate(folds):
         v_labels = [y_raw[i] for i in fold["val"]]
         t_labels = [y_raw[i] for i in fold["test"]]
         print(f"[Fold {k}] 验证集类数：{len(set(v_labels))}，测试集类数：{len(set(t_labels))}")
+
+    total_sec = time.time() - global_start
+    print(f"\n=== 所有 Fold 训练完成，总耗时：{fmt_sec(total_sec)} ===")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
