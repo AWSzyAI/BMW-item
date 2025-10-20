@@ -38,9 +38,10 @@ def build_text(df):
     return (df["case_title"].fillna("") + " " + df["performed_work"].fillna("")).astype(str)
 
 def main(args):
+    path = args.path
     outdir = args.outdir
     # 加载数据
-    df = pd.read_csv(os.path.join(outdir, "df_filtered.csv"))
+    df = pd.read_csv(os.path.join(outdir, path))
     with open(os.path.join(outdir, "folds.json"), "r", encoding="utf-8") as f:
         folds = json.load(f)
     # 只用最优 fold 的 test 集
@@ -87,8 +88,45 @@ def main(args):
         mark = " ✅" if lbl == true_label else ""
         print(f"{lbl:<10}\t{sc:.4f}{mark}")
 
+
+def predict(texts, model_path=None, top_k=10):
+    """Predict top-k labels for given texts.
+
+    texts: str | list[str] | pandas.DataFrame
+    model_path: path to a joblib bundle (defaults to ./output/model_best.joblib)
+    Returns a list of dicts: {'preds': [...], 'scores': [...]} per input.
+    """
+    if model_path is None:
+        model_path = os.path.join("../output", "model_best.joblib")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    bundle = joblib.load(model_path)
+    model = bundle.get("model")
+    le = bundle.get("label_encoder")
+    if model is None or le is None:
+        raise ValueError("Loaded bundle does not contain 'model' and 'label_encoder'.")
+
+    # Normalize input to list of texts
+    if isinstance(texts, pd.DataFrame):
+        X = build_text(texts).tolist()
+    elif isinstance(texts, str):
+        X = [texts]
+    else:
+        # assume iterable of strings
+        X = list(texts)
+
+    probs = model.predict_proba(X)
+    out = []
+    for p in probs:
+        idxs = np.argsort(-p)[:top_k]
+        preds = le.inverse_transform(idxs)
+        scores = p[idxs]
+        out.append({"preds": list(map(str, preds)), "scores": list(map(float, scores))})
+    return out
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str,default="df_filtered_1020_5.csv")
     parser.add_argument("--outdir", type=str, default="./output")
     parser.add_argument("--fold", type=int, default=0)
     args = parser.parse_args()

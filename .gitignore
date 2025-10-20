@@ -3,3 +3,6 @@
 /output/
 .venv/
 __pycache__/
+folder-alias.json
+private-folder-alias.json
+settings.json

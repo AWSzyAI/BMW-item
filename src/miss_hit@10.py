@@ -61,7 +61,7 @@ def main(args):
     miss_rows = []
     for k, fold in enumerate(folds):
         # 加载该折模型
-        bundle = joblib.load(os.path.join(outdir, f"model_fold{k}.joblib"))
+        bundle = joblib.load(os.path.join(outdir, f"model_fold-{k}.joblib"))
         model = bundle["model"]; le = bundle["label_encoder"]
         C = len(le.classes_)
         K = min(10, C)
