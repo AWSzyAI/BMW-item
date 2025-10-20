@@ -3,6 +3,7 @@ import os, json, ast, argparse, warnings, time
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+import matplotlib.pyplot as plt
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
@@ -110,7 +111,16 @@ def main(args):
     y_enc = le.fit_transform(y_raw)  # ndarray shape (N,)
 
     # 定义模型（字符级 n-gram + 逻辑回归）
-    def make_pipeline():
+    class LossCallback:
+        def __init__(self):
+            self.losses = []
+            
+        def __call__(self, params):
+            if hasattr(params, "score"):
+                # LogisticRegression 的损失是负对数似然
+                self.losses.append(-params.score_)
+
+def make_pipeline():
         return Pipeline([
             ("tfidf", TfidfVectorizer(
                 analyzer="char",
@@ -126,7 +136,9 @@ def main(args):
                 solver="saga",
                 C=4.0,
                 multi_class="ovr",
-                random_state=42
+                random_state=42,
+                verbose=1,  # 启用详细输出
+                tol=1e-4    # 收敛容差
             ))
         ])
 
@@ -140,16 +152,47 @@ def main(args):
         y_tr = y_enc[tr_idx]
 
         pipe = make_pipeline()
+        callback = LossCallback()
 
         print(f"\n[Fold {k}] 训练样本数：{len(X_tr)}，类别数：{len(le.classes_)}")
         pipe_fit_start = time.time()
+        # 获取分类器实例
+        clf = pipe.named_steps["clf"]
+        # 设置回调
+        clf._get_loss = callback
+        
         pipe.fit(X_tr, y_tr)
         pipe_fit_end = time.time()
 
+        # 绘制损失曲线
+        plt.figure(figsize=(10, 5))
+        plt.plot(callback.losses, label=f'Fold {k}')
+        plt.xlabel('迭代次数')
+        plt.ylabel('损失值')
+        plt.title(f'Fold {k} 训练损失曲线')
+        plt.legend()
+        plt.grid(True)
+        # 保存损失曲线图
+        loss_plot_path = os.path.join(outdir, f"loss_curve_fold{k}.png")
+        plt.savefig(loss_plot_path)
+        plt.close()
+
+        # 保存损失值数据
+        loss_data_path = os.path.join(outdir, f"loss_data_fold{k}.json")
+        with open(loss_data_path, "w") as f:
+            json.dump({"losses": callback.losses}, f, indent=2)
+
         # 保存模型
         model_path = os.path.join(outdir, f"model_fold{k}.joblib")
-        joblib.dump({"model": pipe, "label_encoder": le}, model_path)
+        joblib.dump({
+            "model": pipe,
+            "label_encoder": le,
+            "losses": callback.losses
+        }, model_path)
         fold_end = time.time()
+        
+        print(f"[Fold {k}] 损失曲线已保存：{loss_plot_path}")
+        print(f"[Fold {k}] 损失数据已保存：{loss_data_path}")
 
         print(f"[Fold {k}] 向量化+训练耗时：{fmt_sec(pipe_fit_end - pipe_fit_start)}")
         print(f"[Fold {k}] 总耗时（含保存）：{fmt_sec(fold_end - fold_start)}")
