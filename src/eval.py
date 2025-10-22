@@ -92,6 +92,45 @@ def main(args):
 
     if mode == "new":
         # new 模式：对整文件进行评估。
+        # 先给出数据与训练类别的对照描述：训练集类别集合 vs 本次评估文件（视作测试集）的标签集合
+        try:
+            train_cls = list(map(str, le.classes_))
+            train_cls_set = set(train_cls)
+            test_labels_series = pd.Series([str(t) for t in y_raw])
+            N_test = len(test_labels_series)
+            uniq_test_labels = set(test_labels_series.unique().tolist())
+            # 样本级统计
+            known_mask = test_labels_series.isin(train_cls_set)
+            n_known_samples = int(known_mask.sum())
+            n_unknown_samples = N_test - n_known_samples
+            # 标签级统计
+            uniq_known_labels = sorted([l for l in uniq_test_labels if l in train_cls_set])
+            uniq_unknown_labels = sorted([l for l in uniq_test_labels if l not in train_cls_set])
+
+            print("\n[data] 训练类别集合与当前文件（测试集视角）对照")
+            print("- Train: #classes=%d" % (len(train_cls)))
+            # 只展示前若干个，避免过长
+            if len(train_cls) > 0:
+                preview = ", ".join(train_cls[:10]) + (" ..." if len(train_cls) > 10 else "")
+                print("  classes preview: %s" % preview)
+            print("- Test(file): N=%d | unique_labels=%d" % (N_test, len(uniq_test_labels)))
+            print("  samples: known=%d | not_in_train=%d" % (n_known_samples, n_unknown_samples))
+            print("  unique labels: known=%d | not_in_train=%d" % (len(uniq_known_labels), len(uniq_unknown_labels)))
+            # 测试集中未在训练出现过的标签 Top-N（按样本数）
+            if len(uniq_unknown_labels) > 0:
+                cnt_unknown = (
+                    test_labels_series[~known_mask]
+                    .value_counts()  # type: ignore
+                    .sort_values(ascending=False)
+                )
+                topn = cnt_unknown.head(10)
+                print("  unseen-in-train labels in test (top by count):")
+                for lbl, cnt in topn.items():
+                    print(f"    {lbl}: {int(cnt)}")
+        except Exception as _e:
+            # 描述性输出失败不影响后续评估
+            print(f"[data] 训练/测试标签描述时出现问题：{_e}")
+
         # 优先：若设置 --reject-threshold 或 --sweep-thresholds，则启用开放集（n+1）评估，基于最大概率阈值拒判为 not_in_train。
         def _compute_probs(Xs_all):
             try:
@@ -288,6 +327,13 @@ def main(args):
                 print("- Not-in-train detection: precision=%.3f | recall=%.3f | f1=%.3f | acc=%.3f" % (
                     r["not_in_train_precision"], r["not_in_train_recall"], r["not_in_train_f1"], r["not_in_train_accuracy"]
                 ))
+                # Final 决策评测（与 predict 的 Final 等价）：
+                # - final_acc = Overall acc（n+1 分类准确率）
+                # - final_known_acc = Known-only 的 hit@1（拒判计为错误）
+                # - final_unknown_recall/precision/f1 = 上述 not-in-train 二分类指标
+                print("- Final decision: final_acc=%.3f | final_known_acc=%.3f | final_unknown_precision=%.3f | final_unknown_recall=%.3f | final_unknown_f1=%.3f" % (
+                    r["acc"], r["known_hit@1"], r["not_in_train_precision"], r["not_in_train_recall"], r["not_in_train_f1"]
+                ))
             else:
                 # 多阈值扫：打印按 not_in_train_f1 排名前三的阈值摘要，完整见 CSV
                 rows_sorted = sorted(rows_by_thr, key=lambda r: r["not_in_train_f1"], reverse=True)
@@ -295,9 +341,12 @@ def main(args):
                 print("\n[new-open-set] Top thresholds by not_in_train_f1 (see threshold_sweep.csv for full):")
                 for r in topn:
                     print(
-                        "  thr=%.4f | overall hit@1=%.3f hit@3=%.3f hit@5=%.3f hit@10=%.3f | known_hit@3=%.3f | OOD: prec=%.3f rec=%.3f f1=%.3f acc=%.3f | reject_rate=%.3f" % (
+                        "  thr=%.4f | overall hit@1=%.3f hit@3=%.3f hit@5=%.3f hit@10=%.3f | known_hit@3=%.3f | "
+                        "OOD: prec=%.3f rec=%.3f f1=%.3f acc=%.3f | reject_rate=%.3f | "
+                        "Final: acc=%.3f known_acc=%.3f" % (
                             r["threshold"], r["hit@1"], r["hit@3"], r["hit@5"], r["hit@10"], r["known_hit@3"],
-                            r["not_in_train_precision"], r["not_in_train_recall"], r["not_in_train_f1"], r["not_in_train_accuracy"], r["reject_rate"]
+                            r["not_in_train_precision"], r["not_in_train_recall"], r["not_in_train_f1"], r["not_in_train_accuracy"], r["reject_rate"],
+                            r["acc"], r["known_hit@1"]
                         )
                     )
                 # 同时标注最佳行
@@ -462,6 +511,33 @@ def main(args):
     for k, fold in enumerate(folds):
         for split_name in ["train", "val", "test"]:
             all_splits[split_name].extend(fold[split_name])
+
+    # 在非 new 模式下，增加对 train/test 标签集合的描述，以及 test 中未见过的标签情况
+    try:
+        if len(all_splits.get("train", [])) > 0 and len(all_splits.get("test", [])) > 0:
+            train_idx = all_splits["train"]
+            test_idx = all_splits["test"]
+            y_train = [str(ensure_single_label(df.iloc[i]["linked_items"])) for i in train_idx]
+            y_test = [str(ensure_single_label(df.iloc[i]["linked_items"])) for i in test_idx]
+            train_set = set(y_train)
+            test_set = set(y_test)
+            unseen_labels = sorted(list(test_set - train_set))
+            # 样本级数量
+            test_unknown_samples = int(sum(1 for t in y_test if t not in train_set))
+            print("\n[data] Split label summary (from folds.json)")
+            print("- Train: N=%d | unique_labels=%d" % (len(train_idx), len(train_set)))
+            print("- Test:  N=%d | unique_labels=%d" % (len(test_idx), len(test_set)))
+            print("  test samples: known=%d | not_in_train=%d" % (len(test_idx) - test_unknown_samples, test_unknown_samples))
+            print("  test unique labels: known=%d | not_in_train=%d" % (len(test_set & train_set), len(unseen_labels)))
+            if len(unseen_labels) > 0:
+                # 统计 test 中未见过标签的样本数，输出 top-N
+                from collections import Counter
+                cnt = Counter([t for t in y_test if t not in train_set])
+                print("  unseen-in-train labels in test (top by count):")
+                for lbl, c in cnt.most_common(10):
+                    print(f"    {lbl}: {c}")
+    except Exception as _e:
+        print(f"[data] 基于折划分的标签描述时出现问题：{_e}")
 
     # 根据模式选择需要评估的切分
     target_splits = ["val", "test"] if mode == "clean" else ["train", "val", "test"]

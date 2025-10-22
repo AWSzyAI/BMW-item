@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-def _ooc_prob_from_detector(ooc_detector, p_max_scalar: float) -> float:
+def _ooc_prob_from_detector(ooc_detector, p_max_scalar: float, override_tau: float | None = None) -> float:
     """从保存的 ooc_detector 计算 not-in-train 概率。
     支持两种形式：
     - {kind:'logreg', estimator: sklearn model}
@@ -36,7 +36,7 @@ def _ooc_prob_from_detector(ooc_detector, p_max_scalar: float) -> float:
             except Exception:
                 return 0.0
         if kind == "threshold":
-            tau = float(ooc_detector.get("tau", 0.5))
+            tau = float(override_tau if override_tau is not None else ooc_detector.get("tau", 0.5))
             T = float(ooc_detector.get("temperature", 20.0))
             # 低于阈值越像 OOC：σ((tau - p_max) * T)
             return float(1.0 / (1.0 + np.exp((p_max_scalar - tau) * T)))
@@ -79,10 +79,24 @@ def main(args):
     preds = le.inverse_transform(sorted_idx[:top_k])
     scores = probs[sorted_idx[:top_k]]
 
-    # 计算 not-in-train 概率（独立输出）
+    # 计算 not-in-train 判定（MSP: 用 p_max 阈值；LogReg: 用概率阈值）
     p_max = float(probs.max())
-    ooc_proba = _ooc_prob_from_detector(ooc_detector, p_max)
-    is_ooc = ooc_proba >= float(getattr(args, "ooc_decision_threshold", 0.5))
+    if isinstance(ooc_detector, dict) and ooc_detector.get("kind") == "logreg":
+        ooc_proba = _ooc_prob_from_detector(ooc_detector, p_max)
+        prob_thr = float(getattr(args, "ooc_decision_threshold", 0.5))
+        is_ooc = (ooc_proba >= prob_thr)
+        decision_info = f"(prob_thr={prob_thr:.3f})"
+    else:
+        # MSP/threshold-based
+        if getattr(args, "reject_threshold", None) is not None:
+            thr = float(args.reject_threshold)
+        elif isinstance(ooc_detector, dict) and ("tau" in ooc_detector):
+            thr = float(ooc_detector["tau"])
+        else:
+            thr = 0.5
+        is_ooc = (p_max < thr)
+        ooc_proba = _ooc_prob_from_detector(ooc_detector, p_max, override_tau=thr)
+        decision_info = f"(p_max={p_max:.4f}, thr={thr:.4f})"
 
     print(f"\n[预测结果] 样本 #{idx}\n")
     print(f"Text: {text[:200]} ...")
@@ -99,7 +113,7 @@ def main(args):
         mark = " ✅" if (true_label is not None and str(lbl) == true_label) else ""
         print(f"{lbl:<10}\t{sc:.4f}{mark}")
     mark = " ✅" if is_ooc else ""
-    print(f"\nNot-in-train probability: {ooc_proba:.4f}{mark}")
+    print(f"\nNot-in-train probability: {ooc_proba:.4f} {decision_info} {mark}".rstrip())
 
     # 最终决策：若 ooc 概率高于阈值 => Not-in-train；否则选择 Top-1 已知标签
     if is_ooc:
@@ -151,7 +165,9 @@ if __name__ == "__main__":
     parser.add_argument("--outdir", type=str, default="./output")
     parser.add_argument("--infile", type=str, default="eval.csv", help="输入文件名（在 outdir 下，或提供绝对路径）")
     parser.add_argument("--index", type=int, default=-1, help="样本下标；<0 则随机")
-    parser.add_argument("--ooc-decision-threshold", type=float, default=0.5, help="将 not-in-train 概率转为判定的阈值")
+    # MSP: p_max 阈值（与 eval 对齐）；LogReg: 概率阈值
+    parser.add_argument("--reject-threshold", type=float, default=None, help="MSP：最大类别概率 p_max 的拒判阈值")
+    parser.add_argument("--ooc-decision-threshold", type=float, default=0.5, help="LogReg 检测器下的概率阈值")
     # 兼容旧参数
     parser.add_argument("--path", type=str, default=None)
     args = parser.parse_args()
