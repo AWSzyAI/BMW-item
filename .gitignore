@@ -6,3 +6,4 @@ __pycache__/
 folder-alias.json
 private-folder-alias.json
 settings.json
+*.joblib

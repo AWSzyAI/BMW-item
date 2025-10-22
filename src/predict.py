@@ -126,7 +126,7 @@ def predict(texts, model_path=None, top_k=10):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str,default="df_filtered_1020_5.csv")
+    parser.add_argument("--path", type=str,default="test.csv")
     parser.add_argument("--outdir", type=str, default="./output")
     parser.add_argument("--fold", type=int, default=0)
     args = parser.parse_args()

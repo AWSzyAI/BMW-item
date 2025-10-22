@@ -1,0 +1,6 @@
+=== 模型训练开始（使用 train.csv / eval.csv）===
+训练完成，耗时 00:13
+Eval metrics: {'accuracy': 0.743421, 'f1_weighted': 0.695128, 'f1_macro': 0.695128}
+模型已保存到: ./models\model_best.joblib
+评估指标已保存到: ./output\metrics_eval.csv
+=== 训练完成，总耗时：00:31 ===

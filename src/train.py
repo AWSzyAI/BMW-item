@@ -1,61 +1,18 @@
-# train.py
-import os, json, ast, argparse, warnings, time
+import os, json, argparse, warnings, time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import SGDClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import log_loss, accuracy_score, f1_score
-
 import joblib
 from tqdm import trange
 
 warnings.filterwarnings("ignore")
-
-def ensure_single_label(s):
-    """若列里偶有 '["a","b"]' 这类字符串，就取第一个；正常单标签直接返回字符串。"""
-    if isinstance(s, list):
-        return str(s[0]) if s else ""
-    if isinstance(s, str):
-        t = s.strip()
-        if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
-            try:
-                v = ast.literal_eval(t)
-                if isinstance(v, (list, tuple)) and len(v) > 0:
-                    return str(v[0])
-            except Exception:
-                pass
-        return t
-    return str(s)
-
-def build_text(df):
-    """将 case_title + performed_work 合并为输入文本"""
-    return (df["case_title"].fillna("") + " " + df["performed_work"].fillna("")).astype(str)
-
-def _flex_read_csv(base_dir: str, filename: str) -> pd.DataFrame:
-    """尝试读取绝对路径；否则从 base_dir/filename 读取。"""
-    if not filename:
-        raise ValueError("filename 不能为空")
-    if os.path.isabs(filename) and os.path.exists(filename):
-        return pd.read_csv(filename)
-    path = os.path.join(base_dir, filename)
-    if os.path.exists(path):
-        return pd.read_csv(path)
-    # 最后再尝试工作目录
-    if os.path.exists(filename):
-        return pd.read_csv(filename)
-    raise FileNotFoundError(f"未找到文件：{filename} 或 {path}")
-
-def fmt_sec(sec: float) -> str:
-    """将秒格式化为 H:MM:SS"""
-    m, s = divmod(int(sec), 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
 
 def main(args):
     global_start = time.time()
@@ -90,30 +47,33 @@ def main(args):
     ev_mask = [lbl in set(le.classes_) for lbl in y_ev_raw]
     if not all(ev_mask):
         dropped = int(np.sum(~np.array(ev_mask)))
-        print(f"[警告] eval 中有 {dropped} 条样本的标签不在训练集中，将从评估中排除。")
+        print(f"[警告] eval 中有 {dropped} 条样本的标签未在训练集中出现（记为 not_in_train），这些样本将从指标计算中排除，仅供事后分析。")
     X_ev_text_f = [t for t, m in zip(X_ev_text, ev_mask) if m]
     y_ev_raw_f = [l for l, m in zip(y_ev_raw, ev_mask) if m]
     y_ev = le.transform(y_ev_raw_f) if len(y_ev_raw_f) > 0 else np.array([])
 
-    # 定义模型：字符级 n-gram + 逻辑回归（warm_start 以便记录多轮损失）
+    # 定义模型：字符级 n-gram + SGDClassifier（对大规模稀疏特征更快）
     pipe = Pipeline([
         ("tfidf", TfidfVectorizer(
-            analyzer="char",
-            ngram_range=(2, 5),
-            max_features=100_000,
+            analyzer=args.tfidf_analyzer,
+            ngram_range=(args.ngram_min, args.ngram_max),
+            max_features=args.tfidf_max_features,
             min_df=1,
-            sublinear_tf=True
+            sublinear_tf=True,
         )),
-        ("clf", LogisticRegression(
-            max_iter=10,
-            warm_start=True,
-            n_jobs=-1,
-            class_weight="balanced",
-            solver="saga",
-            C=4.0,
-            multi_class="multinomial",
+        ("clf", SGDClassifier(
+            loss="log_loss",           # 逻辑回归等价的对数损失
+            max_iter=args.max_epochs,
+            tol=1e-4,
             random_state=42,
-            tol=1e-4
+            early_stopping=True,
+            n_iter_no_change=args.patience,
+            learning_rate="optimal",
+            class_weight=("balanced" if args.class_weight_balanced else None),
+            penalty=args.sgd_penalty,
+            alpha=args.sgd_alpha,
+            average=args.sgd_average,
+            n_jobs=-1,
         ))
     ])
 
@@ -121,52 +81,83 @@ def main(args):
     clf = pipe.named_steps["clf"]
     X_tr_vec = tfidf.fit_transform(X_tr_text)
 
-    # 迭代训练并记录训练损失（对训练集）
+    # 单次拟合（去掉外层 epoch 循环）
     classes = np.arange(len(le.classes_))
-    max_epochs = args.max_epochs
-    patience = args.patience
-    best_loss = float("inf")
-    wait = 0
+    fit_t0 = time.time()
+    clf.fit(X_tr_vec, y_tr)
+    fit_sec = time.time() - fit_t0
+    # SGDClassifier 没有 max_iter 属性? 实际存在，但为参数；此处稳妥打印拟合耗时
+    print(f"训练完成，耗时 {fmt_sec(fit_sec)}")
+
+    # 计算训练集损失（仅一次）
     losses = []
-    epoch_bar = trange(max_epochs, desc="Epochs", ncols=88)
-    for _ in epoch_bar:
-        clf.fit(X_tr_vec, y_tr)
-        # 计算训练损失
+    try:
+        # SGDClassifier 在 loss='log_loss' 时支持 predict_proba
+        y_proba = clf.predict_proba(X_tr_vec)
+        loss_val = float(log_loss(y_tr, y_proba, labels=classes))
+    except Exception:
+        # 兜底：使用 decision_function 转换为概率（多分类使用 softmax）
         try:
-            y_proba = clf.predict_proba(X_tr_vec)
+            dec = clf.decision_function(X_tr_vec)
+            if dec.ndim == 1:
+                probs_pos = 1 / (1 + np.exp(-dec))
+                y_proba = np.vstack([1 - probs_pos, probs_pos]).T
+            else:
+                e = np.exp(dec - np.max(dec, axis=1, keepdims=True))
+                y_proba = e / e.sum(axis=1, keepdims=True)
             loss_val = float(log_loss(y_tr, y_proba, labels=classes))
         except Exception:
-            try:
-                dec = clf.decision_function(X_tr_vec)
-                if dec.ndim == 1:
-                    probs_pos = 1 / (1 + np.exp(-dec))
-                    y_proba = np.vstack([1 - probs_pos, probs_pos]).T
-                else:
-                    e = np.exp(dec - np.max(dec, axis=1, keepdims=True))
-                    y_proba = e / e.sum(axis=1, keepdims=True)
-                loss_val = float(log_loss(y_tr, y_proba, labels=classes))
-            except Exception:
-                # 如果无法计算损失，则跳过该轮的记录
-                continue
-        losses.append(loss_val)
-        epoch_bar.set_postfix({"train_loss": f"{loss_val:.4f}"})
-        if loss_val + 1e-9 < best_loss:
-            best_loss = loss_val
-            wait = 0
-        else:
-            wait += 1
-            if wait >= patience:
-                break
+            loss_val = float("nan")
+    losses.append(loss_val)
 
     # 评估（eval 集）
     X_ev_vec = tfidf.transform(X_ev_text_f) if len(X_ev_text_f) > 0 else None
     eval_metrics = {}
     if X_ev_vec is not None and len(y_ev) > 0:
-        y_pred = clf.predict(X_ev_vec)
+        # 可选：概率校准（提升阈值型/开放集判别的可靠性）
+        calibrator = None
+        if args.calibrate in {"sigmoid", "isotonic"}:
+            try:
+                calibrator = CalibratedClassifierCV(base_estimator=clf, method=args.calibrate, cv="prefit")
+                calibrate_t0 = time.time()
+                calibrator.fit(X_ev_vec, y_ev)
+                print(f"已使用 {args.calibrate} 概率校准（耗时 {fmt_sec(time.time() - calibrate_t0)}）")
+                # 替换管道中的分类器为校准后的版本
+                pipe.named_steps["clf"] = calibrator
+            except Exception as e:
+                print(f"[警告] 概率校准失败，将继续使用未校准模型。原因：{e}")
+
+        # 使用（可能校准的）分类器进行评估
+        clf_for_eval = pipe.named_steps["clf"]
+        y_pred = clf_for_eval.predict(X_ev_vec)
         acc = accuracy_score(y_ev, y_pred)
         f1w = f1_score(y_ev, y_pred, average="weighted")
         f1m = f1_score(y_ev, y_pred, average="macro")
-        eval_metrics = {"accuracy": round(float(acc), 6), "f1_weighted": round(float(f1w), 6), "f1_macro": round(float(f1m), 6)}
+        # 计算概率用于 hit@k
+        y_proba_ev = None
+        try:
+            y_proba_ev = clf_for_eval.predict_proba(X_ev_vec)
+        except Exception:
+            try:
+                dec = clf_for_eval.decision_function(X_ev_vec)
+                if dec.ndim == 1:
+                    probs_pos = 1 / (1 + np.exp(-dec))
+                    y_proba_ev = np.vstack([1 - probs_pos, probs_pos]).T
+                else:
+                    e = np.exp(dec - np.max(dec, axis=1, keepdims=True))
+                    y_proba_ev = e / e.sum(axis=1, keepdims=True)
+            except Exception:
+                y_proba_ev = None
+
+        eval_metrics = {
+            "accuracy": round(float(acc), 6),
+            "f1_weighted": round(float(f1w), 6),
+            "f1_macro": round(float(f1m), 6),
+            "hit@1": round(hit_at_k(y_ev, y_proba_ev, 1), 6) if y_proba_ev is not None else float("nan"),
+            "hit@3": round(hit_at_k(y_ev, y_proba_ev, 3), 6) if y_proba_ev is not None else float("nan"),
+            "hit@5": round(hit_at_k(y_ev, y_proba_ev, 5), 6) if y_proba_ev is not None else float("nan"),
+            "hit@10": round(hit_at_k(y_ev, y_proba_ev, 10), 6) if y_proba_ev is not None else float("nan"),
+        }
         print(f"Eval metrics: {eval_metrics}")
     else:
         print("[提示] eval 集为空或无可评估样本，跳过评估。")
@@ -209,5 +200,15 @@ if __name__ == "__main__":
     parser.add_argument("--outmodel", type=str, default="model_best.joblib", help="模型保存文件名")
     parser.add_argument("--max-epochs", type=int, default=100, help="最大迭代轮次")
     parser.add_argument("--patience", type=int, default=5, help="早停耐心值")
+    # 可调向量化/优化参数（为了冲击更高 hit@3 & 稳定概率）
+    parser.add_argument("--tfidf-analyzer", type=str, default="char", choices=["char", "char_wb"], help="TF-IDF 分析粒度")
+    parser.add_argument("--ngram-min", type=int, default=2, help="ngram 最小长度")
+    parser.add_argument("--ngram-max", type=int, default=5, help="ngram 最大长度")
+    parser.add_argument("--tfidf-max-features", type=int, default=100_000, help="TF-IDF 最大特征数（可调大以提升效果）")
+    parser.add_argument("--sgd-penalty", type=str, default="l2", choices=["l2", "l1", "elasticnet"], help="SGD 正则项")
+    parser.add_argument("--sgd-alpha", type=float, default=0.0001, help="SGD 正则强度 alpha")
+    parser.add_argument("--sgd-average", action="store_true", help="启用参数平均（有助于泛化）")
+    parser.add_argument("--class-weight-balanced", action="store_true", help="启用类别平衡权重")
+    parser.add_argument("--calibrate", type=str, default="none", choices=["none", "sigmoid", "isotonic"], help="概率校准方式（基于 eval 进行预拟合）")
     args = parser.parse_args()
     main(args)
