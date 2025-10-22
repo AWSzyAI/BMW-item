@@ -86,6 +86,7 @@ def main(args):
     bundle = joblib.load(best_model_path)
     model = bundle["model"]
     le = bundle["label_encoder"]
+    ooc_detector = bundle.get("ooc_detector")
 
     results = {}
 
@@ -224,6 +225,12 @@ def main(args):
             return rows_by_thr
 
         sweep_spec = getattr(args, "sweep_thresholds", None)
+        # 若未显式提供阈值/扫描，且模型保存了基于MSP的阈值检测器，则默认采用其 tau 作为阈值
+        if (getattr(args, "reject_threshold", None) is None) and (sweep_spec is None or len(str(sweep_spec).strip()) == 0):
+            if isinstance(ooc_detector, dict) and ooc_detector.get("kind") == "threshold" and ("tau" in ooc_detector):
+                args.reject_threshold = float(ooc_detector["tau"])  # MSP: p_max < tau => reject
+                print(f"[new-open-set] 使用模型内置 MSP 阈值 tau={args.reject_threshold:.4f} 进行开放集评估")
+
         if (getattr(args, "reject_threshold", None) is not None) or (sweep_spec is not None and len(str(sweep_spec).strip()) > 0):
             Xs_all = X_text
             y_proba_all = _compute_probs(Xs_all)
@@ -258,12 +265,47 @@ def main(args):
             sweep_df.to_csv(sweep_path, index=False, encoding="utf-8-sig")
             print(f"开放集阈值扫描结果已保存：{sweep_path}")
 
-            # 打印关键指标（若有目标可据此选阈值）
-            best_row = max(rows_by_thr, key=lambda r: r["not_in_train_f1"])  # 示例：按 not_in_train F1 选最优
-            print(
-                f"[new-open-set] best_by_f1 threshold={best_row['threshold']:.3f} | known_hit@3={best_row['known_hit@3']:.3f} | "
-                f"not_in_train_recall={best_row['not_in_train_recall']:.3f} | not_in_train_f1={best_row['not_in_train_f1']:.3f}"
-            )
+            # 控制台打印：
+            if len(thresholds) == 1:
+                # 单阈值：全面打印（包含/不包含 not-in-train、not-in-train 二分类、整体 hit@1/3/5/10）
+                r = rows_by_thr[0]
+                print("\n[new-open-set] Summary at threshold=%.4f" % r["threshold"]) 
+                print("- Counts: N=%d | known=%d | not_in_train=%d | reject_rate=%.3f" % (
+                    r["N"], r["known"], r["not_in_train"], r["reject_rate"]
+                ))
+                # overall（包含 not-in-train 作为一个类）
+                print("- Overall: acc=%.3f | f1_macro=%.3f | f1_weighted=%.3f" % (
+                    r["acc"], r["f1_macro"], r["f1_weighted"]
+                ))
+                print("- Overall hit@k: hit@1=%.3f | hit@3=%.3f | hit@5=%.3f | hit@10=%.3f" % (
+                    r["hit@1"], r["hit@3"], r["hit@5"], r["hit@10"]
+                ))
+                # known-only（不包含 not-in-train）
+                print("- Known-only hit@k: hit@1=%.3f | hit@3=%.3f | hit@5=%.3f | hit@10=%.3f" % (
+                    r["known_hit@1"], r["known_hit@3"], r["known_hit@5"], r["known_hit@10"]
+                ))
+                # not-in-train 二分类
+                print("- Not-in-train detection: precision=%.3f | recall=%.3f | f1=%.3f | acc=%.3f" % (
+                    r["not_in_train_precision"], r["not_in_train_recall"], r["not_in_train_f1"], r["not_in_train_accuracy"]
+                ))
+            else:
+                # 多阈值扫：打印按 not_in_train_f1 排名前三的阈值摘要，完整见 CSV
+                rows_sorted = sorted(rows_by_thr, key=lambda r: r["not_in_train_f1"], reverse=True)
+                topn = rows_sorted[:min(3, len(rows_sorted))]
+                print("\n[new-open-set] Top thresholds by not_in_train_f1 (see threshold_sweep.csv for full):")
+                for r in topn:
+                    print(
+                        "  thr=%.4f | overall hit@1=%.3f hit@3=%.3f hit@5=%.3f hit@10=%.3f | known_hit@3=%.3f | OOD: prec=%.3f rec=%.3f f1=%.3f acc=%.3f | reject_rate=%.3f" % (
+                            r["threshold"], r["hit@1"], r["hit@3"], r["hit@5"], r["hit@10"], r["known_hit@3"],
+                            r["not_in_train_precision"], r["not_in_train_recall"], r["not_in_train_f1"], r["not_in_train_accuracy"], r["reject_rate"]
+                        )
+                    )
+                # 同时标注最佳行
+                best_row = rows_sorted[0]
+                print(
+                    f"[new-open-set] best_by_f1 threshold={best_row['threshold']:.3f} | known_hit@3={best_row['known_hit@3']:.3f} | "
+                    f"not_in_train_recall={best_row['not_in_train_recall']:.3f} | not_in_train_f1={best_row['not_in_train_f1']:.3f}"
+                )
 
             # 若仅单阈值，导出逐样本
             if len(thresholds) == 1:

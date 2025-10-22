@@ -166,6 +166,64 @@ def main(args):
     else:
         print("[提示] eval 集为空或无可评估样本，跳过评估。")
 
+    # 训练未知标签（not-in-train）检测器（MSP：最大软概率阈值法，若有正样本则可用LogReg）
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+
+    clf_final = pipe.named_steps["clf"]  # 可能已被校准替换
+
+    # 1) 在 eval 上计算 p_max（若 eval 为空则跳过）
+    y_ooc = None
+    p_max_ev_all = None
+    if len(X_ev_text) > 0:
+        y_ooc = np.array([0 if lbl in set(le.classes_) else 1 for lbl in y_ev_raw])
+        X_ev_vec_all = tfidf.transform(X_ev_text)
+        try:
+            y_proba_ev_all = clf_final.predict_proba(X_ev_vec_all)
+        except Exception:
+            dec_all = clf_final.decision_function(X_ev_vec_all)
+            if dec_all.ndim == 1:
+                probs_pos = 1 / (1 + np.exp(-dec_all))
+                y_proba_ev_all = np.vstack([1 - probs_pos, probs_pos]).T
+            else:
+                e = np.exp(dec_all - np.max(dec_all, axis=1, keepdims=True))
+                y_proba_ev_all = e / e.sum(axis=1, keepdims=True)
+        p_max_ev_all = y_proba_ev_all.max(axis=1).reshape(-1, 1)
+
+    # 2) 统计 ID 的 p_max 分布（优先 eval 中的 ID；否则回退到 train）
+    if p_max_ev_all is not None and y_ooc is not None and np.any(y_ooc == 0):
+        id_pmax_for_stats = p_max_ev_all[y_ooc == 0].ravel()
+    else:
+        # 回退使用训练集 p_max 作为 ID 分布
+        try:
+            y_proba_tr_all = clf_final.predict_proba(X_tr_vec)
+        except Exception:
+            dec_tr = clf_final.decision_function(X_tr_vec)
+            if dec_tr.ndim == 1:
+                probs_pos = 1 / (1 + np.exp(-dec_tr))
+                y_proba_tr_all = np.vstack([1 - probs_pos, probs_pos]).T
+            else:
+                e = np.exp(dec_tr - np.max(dec_tr, axis=1, keepdims=True))
+                y_proba_tr_all = e / e.sum(axis=1, keepdims=True)
+        id_pmax_for_stats = y_proba_tr_all.max(axis=1)
+
+    # 3) 若 eval 有 OOD 正样本，拟合 LogReg；否则使用MSP分位数阈值回退
+    ooc_detector = None
+    if y_ooc is not None and len(np.unique(y_ooc)) >= 2:
+        ooc_clf = LogisticRegression(random_state=42)
+        ooc_clf.fit(p_max_ev_all, y_ooc)
+        try:
+            auc = roc_auc_score(y_ooc, ooc_clf.predict_proba(p_max_ev_all)[:, 1])
+            print(f"OOC detection(LogReg) AUC: {auc:.4f}")
+        except Exception:
+            print("OOC detection(LogReg) fitted (AUC unavailable)")
+        ooc_detector = {"kind": "logreg", "estimator": ooc_clf}
+    else:
+        tau = float(np.percentile(id_pmax_for_stats, getattr(args, "ooc_tau_percentile", 5.0)))
+        temperature = float(getattr(args, "ooc_temperature", 20.0))
+        ooc_detector = {"kind": "threshold", "tau": tau, "temperature": temperature}
+        print(f"OOC detection(Threshold) used: tau(p_max)={tau:.4f} at {getattr(args, 'ooc_tau_percentile', 5.0)}th percentile (no positive OOD)")
+
     # 保存 loss 曲线
     plt.figure(figsize=(10, 5))
     plt.plot(losses, label='train')
@@ -181,7 +239,8 @@ def main(args):
         json.dump({"losses": losses}, f, ensure_ascii=False, indent=2)
 
     # 保存模型
-    model_bundle = {"model": pipe, "label_encoder": le}
+    # 保存模型及未知标签检测器
+    model_bundle = {"model": pipe, "label_encoder": le, "ooc_detector": ooc_detector}
     model_path = os.path.join(args.modelsdir, args.outmodel)
     joblib.dump(model_bundle, model_path)
     print(f"模型已保存到: {model_path}")
@@ -214,5 +273,8 @@ if __name__ == "__main__":
     parser.add_argument("--sgd-average", action="store_true", help="启用参数平均（有助于泛化）")
     parser.add_argument("--class-weight-balanced", action="store_true", help="启用类别平衡权重")
     parser.add_argument("--calibrate", type=str, default="none", choices=["none", "sigmoid", "isotonic"], help="概率校准方式（基于 eval 进行预拟合）")
+    # OOC/MSP 阈值回退参数
+    parser.add_argument("--ooc-tau-percentile", type=float, default=5.0, help="无 OOD 正样本时，p_max 的分位数阈值（百分位）")
+    parser.add_argument("--ooc-temperature", type=float, default=20.0, help="将 (tau - p_max) 经 sigmoid 映射为概率的温度系数")
     args = parser.parse_args()
     main(args)

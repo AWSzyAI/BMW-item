@@ -1,8 +1,9 @@
 # predict.py
-import os, json, argparse, random, ast, sys
-import pandas as pd
+import os, argparse, random, sys
 import numpy as np
 import joblib
+from utils import _flex_read_csv, build_text, ensure_single_label
+import pandas as pd
 
 # Compatibility: some saved joblib bundles reference LossCallback under __main__
 # (e.g. when model was saved from train.py run as __main__). To allow
@@ -14,69 +15,98 @@ try:
     if _mod is not None and not hasattr(_mod, "LossCallback"):
         setattr(_mod, "LossCallback", _train_module.LossCallback)
 except Exception:
-    # if import/inject fails, let joblib raise the original error when loading
     pass
 
-def ensure_single_label(s):
-    """将可能是列表或字符串列表的字段转为单标签字符串。"""
-    if isinstance(s, list):
-        return str(s[0]) if s else ""
-    if isinstance(s, str):
-        t = s.strip()
-        if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
+def _ooc_prob_from_detector(ooc_detector, p_max_scalar: float) -> float:
+    """从保存的 ooc_detector 计算 not-in-train 概率。
+    支持两种形式：
+    - {kind:'logreg', estimator: sklearn model}
+    - {kind:'threshold', tau: float, temperature: float}
+    也兼容直接保存的 sklearn 模型。
+    """
+    if ooc_detector is None:
+        return 0.0
+    # dict 格式
+    if isinstance(ooc_detector, dict):
+        kind = ooc_detector.get("kind")
+        if kind == "logreg" and "estimator" in ooc_detector:
+            est = ooc_detector["estimator"]
             try:
-                v = ast.literal_eval(t)
-                if isinstance(v, (list, tuple)) and len(v) > 0:
-                    return str(v[0])
+                return float(est.predict_proba(np.array([[p_max_scalar]]))[:, 1][0])
             except Exception:
-                pass
-        return t
-    return str(s)
-
-def build_text(df):
-    """组合 case_title + performed_work"""
-    return (df["case_title"].fillna("") + " " + df["performed_work"].fillna("")).astype(str)
+                return 0.0
+        if kind == "threshold":
+            tau = float(ooc_detector.get("tau", 0.5))
+            T = float(ooc_detector.get("temperature", 20.0))
+            # 低于阈值越像 OOC：σ((tau - p_max) * T)
+            return float(1.0 / (1.0 + np.exp((p_max_scalar - tau) * T)))
+    # 直接当作 sklearn 模型
+    try:
+        return float(ooc_detector.predict_proba(np.array([[p_max_scalar]]))[:, 1][0])
+    except Exception:
+        return 0.0
 
 def main(args):
-    path = args.path
-    outdir = args.outdir
-    # 加载数据
-    df = pd.read_csv(os.path.join(outdir, path))
-    # 加载模型
-    best_model_path = os.path.join(outdir, "model_best.joblib")
-    if not os.path.exists(best_model_path):
-        raise FileNotFoundError(f"Best model not found: {best_model_path}")
-    bundle = joblib.load(best_model_path)
+    # 解析模型路径
+    modelsdir = args.modelsdir
+    model_name = args.model
+    bundle_path = os.path.join(modelsdir, model_name)
+    if not os.path.exists(bundle_path):
+        raise FileNotFoundError(f"Model not found: {bundle_path}")
+    bundle = joblib.load(bundle_path)
     model = bundle["model"]
     le = bundle["label_encoder"]
-    # 直接从文件中抽取一条样本进行预测
-    # 规范标签字段
-    df["linked_items"] = df["linked_items"].apply(ensure_single_label).astype(str)
+    ooc_detector = bundle.get("ooc_detector")
+
+    # 读取输入样本
+    outdir = args.outdir
+    infile = args.infile if args.infile else args.path  # 兼容旧参数 --path
+    df = _flex_read_csv(outdir, infile)
     texts = build_text(df).tolist()
-    labels = df["linked_items"].tolist()
-    # 过滤未知标签
-    valid = [lbl in set(le.classes_) for lbl in labels]
-    if not any(valid):
-        print("无可用的已知标签样本，无法预测。")
-        return
-    texts_f = [t for t, ok in zip(texts, valid) if ok]
-    labels_f = [l for l, ok in zip(labels, valid) if ok]
-    idx = random.randint(0, len(texts_f) - 1)
-    text = texts_f[idx]
-    true_label = labels_f[idx]
+    if len(texts) == 0:
+        raise ValueError("输入文件为空或无法构造文本。")
+
+    # 选择索引
+    idx = args.index
+    if idx is None or idx < 0 or idx >= len(texts):
+        idx = random.randint(0, len(texts) - 1)
+    text = texts[idx]
+
+    # 预测已知类别概率
     probs = model.predict_proba([text])[0]
     sorted_idx = np.argsort(-probs)
-    preds = le.inverse_transform(sorted_idx)
-    scores = probs[sorted_idx]
+    top_k = min(10, probs.shape[0])
+    preds = le.inverse_transform(sorted_idx[:top_k])
+    scores = probs[sorted_idx[:top_k]]
+
+    # 计算 not-in-train 概率（独立输出）
+    p_max = float(probs.max())
+    ooc_proba = _ooc_prob_from_detector(ooc_detector, p_max)
+    is_ooc = ooc_proba >= float(getattr(args, "ooc_decision_threshold", 0.5))
+
     print(f"\n[预测结果] 样本 #{idx}\n")
     print(f"Text: {text[:200]} ...")
-    print(f"True label: {true_label}")
-    hits = {f"hit@{k}": int(true_label in preds[:k]) for k in [1, 3, 5, 10]}
-    print("Hit stats:", "  ".join([f"{k}={v}" for k,v in hits.items()]))
+    # 打印真实标签及其是否在训练集中出现
+    true_label = None
+    if "linked_items" in df.columns:
+        true_label = str(ensure_single_label(df.iloc[idx]["linked_items"]))
+        in_train = true_label in set(le.classes_)
+        print(f"True label: {true_label}  (in_train={in_train})")
+    else:
+        print("True label: [列 linked_items 缺失]")
     print("\nTop-10 predictions:")
-    for lbl, sc in zip(preds[:10], scores[:10]):
-        mark = " ✅" if lbl == true_label else ""
+    for lbl, sc in zip(preds, scores):
+        mark = " ✅" if (true_label is not None and str(lbl) == true_label) else ""
         print(f"{lbl:<10}\t{sc:.4f}{mark}")
+    mark = " ✅" if is_ooc else ""
+    print(f"\nNot-in-train probability: {ooc_proba:.4f}{mark}")
+
+    # 最终决策：若 ooc 概率高于阈值 => Not-in-train；否则选择 Top-1 已知标签
+    if is_ooc:
+        print("Final: Not-in-train")
+    else:
+        top1 = str(preds[0]) if len(preds) > 0 else ""
+        print(f"Final: {top1}（Known）")
 
 
 def predict(texts, model_path=None, top_k=10):
@@ -116,8 +146,13 @@ def predict(texts, model_path=None, top_k=10):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str,default="m_test.csv")
+    parser.add_argument("--modelsdir", type=str, default="./models")
+    parser.add_argument("--model", type=str, default="model_best.joblib")
     parser.add_argument("--outdir", type=str, default="./output")
-    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--infile", type=str, default="eval.csv", help="输入文件名（在 outdir 下，或提供绝对路径）")
+    parser.add_argument("--index", type=int, default=-1, help="样本下标；<0 则随机")
+    parser.add_argument("--ooc-decision-threshold", type=float, default=0.5, help="将 not-in-train 概率转为判定的阈值")
+    # 兼容旧参数
+    parser.add_argument("--path", type=str, default=None)
     args = parser.parse_args()
     main(args)
