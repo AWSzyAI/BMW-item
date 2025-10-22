@@ -47,19 +47,23 @@ def main(args):
     ev_mask = [lbl in set(le.classes_) for lbl in y_ev_raw]
     if not all(ev_mask):
         dropped = int(np.sum(~np.array(ev_mask)))
-        print(f"[警告] eval 中有 {dropped} 条样本的标签未在训练集中出现（记为 not_in_train），这些样本将从指标计算中排除，仅供事后分析。")
+        print(f"[警告] eval 中有 {dropped} 条样本的标签未在训练集中出现（记为 not_in_train）")
     X_ev_text_f = [t for t, m in zip(X_ev_text, ev_mask) if m]
     y_ev_raw_f = [l for l, m in zip(y_ev_raw, ev_mask) if m]
     y_ev = le.transform(y_ev_raw_f) if len(y_ev_raw_f) > 0 else np.array([])
+    # todo: 被过滤掉的not-in-train的样本没被处理
+
+
 
     # 定义模型：字符级 n-gram + SGDClassifier（对大规模稀疏特征更快）
     pipe = Pipeline([
         ("tfidf", TfidfVectorizer(
+            # 基于“词”(word)还是“字符”(char/char_wb)来划分 n-gram
             analyzer=args.tfidf_analyzer,
             ngram_range=(args.ngram_min, args.ngram_max),
             max_features=args.tfidf_max_features,
             min_df=1,
-            sublinear_tf=True,
+            sublinear_tf=True, # 对原始词频做子线性缩放，即 tf ← 1 + log(tf)，增强对低频但区分性强的 n-gram 的权重。
         )),
         ("clf", SGDClassifier(
             loss="log_loss",           # 逻辑回归等价的对数损失

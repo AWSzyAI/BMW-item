@@ -57,3 +57,37 @@ def fmt_sec(sec: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def eval_split(model, le, X_text, y_raw, indices):
+    y_true = le.transform([y_raw[i] for i in indices])
+    Xs = [X_text[i] for i in indices]
+    y_pred = model.predict(Xs)
+    if isinstance(y_pred[0], str):
+        y_pred = le.transform(y_pred)
+    y_pred = np.asarray(y_pred)
+    y_proba = model.predict_proba(Xs)
+
+    m = {}
+    m["acc"] = accuracy_score(y_true, y_pred)
+    m["bal_acc"] = balanced_accuracy_score(y_true, y_pred)
+    m["f1_macro"] = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    m["f1_weighted"] = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    m["prec_macro"] = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    m["rec_macro"] = recall_score(y_true, y_pred, average="macro", zero_division=0)
+
+    try:
+        m["logloss"] = log_loss(y_true, y_proba, labels=np.arange(len(le.classes_)))
+    except Exception:
+        m["logloss"] = np.nan
+
+    try:
+        m["auc_macro"] = roc_auc_score(
+            y_true, y_proba, multi_class="ovo", average="macro", labels=np.arange(len(le.classes_))
+        )
+    except Exception:
+        m["auc_macro"] = np.nan
+
+    for k in [1, 3, 5, 10]:
+        m[f"hit@{k}"] = hit_at_k(y_true, y_proba, k)
+    return m

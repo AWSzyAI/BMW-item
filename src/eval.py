@@ -8,73 +8,48 @@ from sklearn.metrics import (
     balanced_accuracy_score, log_loss, roc_auc_score
 )
 
-def ensure_single_label(s):
-    if isinstance(s, list):
-        return str(s[0]) if s else ""
-    if isinstance(s, str):
-        t = s.strip()
-        if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
-            try:
-                v = ast.literal_eval(t)
-                if isinstance(v, (list, tuple)) and len(v) > 0:
-                    return str(v[0])
-            except Exception:
-                pass
-        return t
-    return str(s)
+from utils import ensure_single_label, build_text, hit_at_k, eval_split
+# def ensure_single_label(s):
+#     if isinstance(s, list):
+#         return str(s[0]) if s else ""
+#     if isinstance(s, str):
+#         t = s.strip()
+#         if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
+#             try:
+#                 v = ast.literal_eval(t)
+#                 if isinstance(v, (list, tuple)) and len(v) > 0:
+#                     return str(v[0])
+#             except Exception:
+#                 pass
+#         return t
+#     return str(s)
+# def build_text(df):
+#     parts = [df.get("case_title", "").fillna("").astype(str),
+#              df.get("performed_work", "").fillna("").astype(str)]
+#     if "item_title" in df.columns:
+#         parts.append(df["item_title"].fillna("").astype(str))
+#     return (parts[0] + " " + parts[1] + (" " + parts[2] if len(parts) > 2 else "")).astype(str)
 
-def build_text(df):
-    parts = [df.get("case_title", "").fillna("").astype(str),
-             df.get("performed_work", "").fillna("").astype(str)]
-    if "item_title" in df.columns:
-        parts.append(df["item_title"].fillna("").astype(str))
-    return (parts[0] + " " + parts[1] + (" " + parts[2] if len(parts) > 2 else "")).astype(str)
+# def hit_at_k(y_true_idx: np.ndarray, y_proba: np.ndarray, k: int) -> float:
+#     """计算 hit@k 命中率"""
+#     topk_idx = np.argsort(-y_proba, axis=1)[:, :k]
+#     hits = (topk_idx == y_true_idx.reshape(-1, 1)).any(axis=1)
+#     return float(hits.mean())
 
-def hit_at_k(y_true_idx: np.ndarray, y_proba: np.ndarray, k: int) -> float:
-    """计算 hit@k 命中率"""
-    topk_idx = np.argsort(-y_proba, axis=1)[:, :k]
-    hits = (topk_idx == y_true_idx.reshape(-1, 1)).any(axis=1)
-    return float(hits.mean())
 
-def eval_split(model, le, X_text, y_raw, indices):
-    y_true = le.transform([y_raw[i] for i in indices])
-    Xs = [X_text[i] for i in indices]
-    y_pred = model.predict(Xs)
-    if isinstance(y_pred[0], str):
-        y_pred = le.transform(y_pred)
-    y_pred = np.asarray(y_pred)
-    y_proba = model.predict_proba(Xs)
-
-    m = {}
-    m["acc"] = accuracy_score(y_true, y_pred)
-    m["bal_acc"] = balanced_accuracy_score(y_true, y_pred)
-    m["f1_macro"] = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    m["f1_weighted"] = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-    m["prec_macro"] = precision_score(y_true, y_pred, average="macro", zero_division=0)
-    m["rec_macro"] = recall_score(y_true, y_pred, average="macro", zero_division=0)
-
-    try:
-        m["logloss"] = log_loss(y_true, y_proba, labels=np.arange(len(le.classes_)))
-    except Exception:
-        m["logloss"] = np.nan
-
-    try:
-        m["auc_macro"] = roc_auc_score(
-            y_true, y_proba, multi_class="ovo", average="macro", labels=np.arange(len(le.classes_))
-        )
-    except Exception:
-        m["auc_macro"] = np.nan
-
-    for k in [1, 3, 5, 10]:
-        m[f"hit@{k}"] = hit_at_k(y_true, y_proba, k)
-    return m
 
 def main(args):
+
+    # test.csv to be evaluated
     path = args.path
+
     outdir = args.outdir
-    mode = args.mode
     os.makedirs(outdir, exist_ok=True)
 
+    # mode: new,dirty,clean
+    mode = args.mode
+    
+    # path 参数有歧义，有时是在outdir之下，有时是完整路径
     # 读取数据文件：优先按给定路径，其次在 outdir/path
     read_candidates = [path, os.path.join(outdir, path)]
     file_to_read = None
@@ -88,7 +63,13 @@ def main(args):
         if not os.path.exists(file_to_read):
             raise FileNotFoundError(f"找不到评估数据文件：{path} 或 {file_to_read}")
 
+
+
     df = pd.read_csv(file_to_read)
+    # check X,y
+    # X: case_title + performed_work, (case_submitted_date)//data有什么用呢？预测未来的故障趋势？根据季节/型号发售时间来检测集中爆发的故障？
+    # y: linked_items, (item_title)//目前为止item_title还没有被用起来
+
     for col in ["case_title", "performed_work", "linked_items"]:
         if col not in df.columns:
             raise KeyError(f"{file_to_read} 缺少列：{col}")
