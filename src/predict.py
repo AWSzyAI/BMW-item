@@ -100,14 +100,30 @@ def main(args):
 
     print(f"\n[预测结果] 样本 #{idx}\n")
     print(f"Text: {text[:200]} ...")
-    # 打印真实标签及其是否在训练集中出现
+    # 打印真实标签及其是否在训练集中出现，并同时打印对应的 item_title（若存在）
     true_label = None
     if "linked_items" in df.columns:
         true_label = str(ensure_single_label(df.iloc[idx]["linked_items"]))
         in_train = true_label in set(le.classes_)
-        print(f"True label: {true_label}  (in_train={in_train})")
+        if "item_title" in df.columns:
+            item_title_val = df.iloc[idx].get("item_title")
+            try:
+                item_title_str = "" if pd.isna(item_title_val) else str(item_title_val)
+            except Exception:
+                item_title_str = str(item_title_val)
+            print(f"True label: {true_label}  (in_train={in_train}) | item_title: {item_title_str}")
+        else:
+            print(f"True label: {true_label}  (in_train={in_train}) | item_title: [列 item_title 缺失]")
     else:
-        print("True label: [列 linked_items 缺失]")
+        if "item_title" in df.columns:
+            item_title_val = df.iloc[idx].get("item_title")
+            try:
+                item_title_str = "" if pd.isna(item_title_val) else str(item_title_val)
+            except Exception:
+                item_title_str = str(item_title_val)
+            print(f"True label: [列 linked_items 缺失] | item_title: {item_title_str}")
+        else:
+            print("True label: [列 linked_items 缺失] | item_title: [列 item_title 缺失]")
     print("\nTop-10 predictions:")
     for lbl, sc in zip(preds, scores):
         mark = " ✅" if (true_label is not None and str(lbl) == true_label) else ""
