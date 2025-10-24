@@ -1,0 +1,25 @@
+
+[data] 训练类别集合与当前文件（测试集视角）对照
+- Train: #classes=2618
+  classes preview: 10060, 10079, 10152, 10183, 10189, 10402, 10432, 10779, 10804, 10893 ...
+- Test(file): N=10237 | unique_labels=1290
+  samples: known=9807 | not_in_train=430
+  unique labels: known=1175 | not_in_train=115
+  unseen-in-train labels in test (top by count):
+    52751: 53
+    53170: 52
+    52595: 52
+    52348: 29
+    53039: 21
+    53015: 21
+    52616: 19
+    52633: 18
+    52647: 15
+    53143: 9
+[new] 样本总数=10237，in_train=9807，not_in_train=430
+[new] 注意：共有 430 条样本的标签不在训练类别中（记为 not_in_train）
+[new]
+acc=0.705 | f1_macro=0.237 | hit@1=0.705 | hit@3=0.780 | hit@5=0.808 | hit@10=0.839
+逐样本预测已保存：./output/2025_up_to_month_9/predictions_test.csv
+
+Best model metrics saved to ./output/2025_up_to_month_9/metrics_best_model_all_splits.csv
