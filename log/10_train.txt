@@ -1,3 +1,9 @@
 === 模型训练开始（使用 train.csv / eval.csv）===
 已复制 664 个单样本类别，以平衡训练集。
 [警告] eval 中有 164 条样本的标签未在训练集中出现（记为 not_in_train）
+训练完成，耗时 18:14
+Eval metrics: {'accuracy': 0.764827, 'f1_weighted': 0.686572, 'f1_macro': 0.204099, 'hit@1': 0.764827, 'hit@3': 0.832557, 'hit@5': 0.857832, 'hit@10': 0.888482}
+OOC detection(LogReg) AUC: 0.8993
+模型已保存到: ./models/10.joblib
+评估指标已保存到: ./output/2025_up_to_month_10/metrics_eval.csv
+=== 训练完成，总耗时：29:59 ===

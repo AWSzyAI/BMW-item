@@ -177,8 +177,8 @@ def predict(texts, model_path=None, top_k=10):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--modelsdir", type=str, default="./models")
-    parser.add_argument("--model", type=str, default="model_best.joblib")
-    parser.add_argument("--outdir", type=str, default="./output")
+    parser.add_argument("--model", type=str, default="7.joblib")
+    parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_7")
     parser.add_argument("--infile", type=str, default="eval.csv", help="输入文件名（在 outdir 下，或提供绝对路径）")
     parser.add_argument("--index", type=int, default=-1, help="样本下标；<0 则随机")
     # MSP: p_max 阈值（与 eval 对齐）；LogReg: 概率阈值

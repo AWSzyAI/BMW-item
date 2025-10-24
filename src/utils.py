@@ -28,11 +28,11 @@ def ensure_single_label(s):
     return str(s)
 
 def build_text(df):
-    """合并文本字段：case_title + performed_work [+ item_title(若存在)]"""
+    """合并文本字段：case_title + performed_work"""
     parts = [df.get("case_title", "").fillna("").astype(str),
              df.get("performed_work", "").fillna("").astype(str)]
-    if "item_title" in df.columns:
-        parts.append(df["item_title"].fillna("").astype(str))
+    # if "item_title" in df.columns:
+    #     parts.append(df["item_title"].fillna("").astype(str))
     return (parts[0] + " " + parts[1] + (" " + parts[2] if len(parts) > 2 else "")).astype(str)
 
 def hit_at_k(y_true_idx: np.ndarray, y_proba: np.ndarray, k: int) -> float:
