@@ -3,6 +3,11 @@ import ast
 import numpy as np
 import pandas as pd
 import os
+
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    balanced_accuracy_score, log_loss, roc_auc_score
+)
 def ensure_single_label(s):
     """
     处理linked_items字段。

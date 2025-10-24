@@ -9,7 +9,7 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import log_loss, accuracy_score, f1_score
 import joblib
-from tqdm import trange
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
@@ -38,6 +38,19 @@ def main(args):
     y_tr_raw = df_tr["linked_items"].astype(str).tolist()
     X_ev_text = build_text(df_ev).tolist()
     y_ev_raw = df_ev["linked_items"].astype(str).tolist()
+    
+    # 如果某一标签下只有一个样本，那就把这个样本复制一份
+    vc = df_tr["linked_items"].value_counts()
+    rare_labels = vc[vc == 1].index.tolist()
+    if rare_labels:
+        rare_samples = df_tr[df_tr["linked_items"].isin(rare_labels)]
+        df_tr = pd.concat([df_tr, rare_samples], ignore_index=True)
+        print(f"已复制 {len(rare_samples)} 个单样本类别，以平衡训练集。")
+    
+    # 更新文本与标签（复制后）
+    X_tr_text = build_text(df_tr).tolist()
+    y_tr_raw = df_tr["linked_items"].astype(str).tolist()
+
 
     # 标签编码（仅基于训练集）
     le = LabelEncoder()
@@ -83,7 +96,42 @@ def main(args):
 
     tfidf = pipe.named_steps["tfidf"]
     clf = pipe.named_steps["clf"]
+
+    # === 进度条与剩余时间估计 ===
+    # 根据是否存在可评估的 eval，和是否开启概率校准，动态确定流程步数
+    do_eval = (len(X_ev_text_f) > 0 and len(y_ev) > 0)
+    do_calib = (args.calibrate in {"sigmoid", "isotonic"}) and do_eval
+    total_steps = 0
+    # 我们跟踪以下阶段：
+    # 1) 向量化训练集  2) 拟合分类器  3) 向量化验证集(可选)  4) 概率校准(可选)
+    # 5) 验证评估(可选) 6) 训练 OOD 检测器 7) 保存loss曲线 8) 保存模型 9) 保存评估指标(可选)
+    total_steps += 1  # vectorize train
+    total_steps += 1  # fit classifier
+    if do_eval:
+        total_steps += 1  # vectorize eval
+    if do_calib:
+        total_steps += 1  # calibrate
+    if do_eval:
+        total_steps += 1  # eval metrics
+    total_steps += 1      # ood detector
+    total_steps += 1      # save loss
+    total_steps += 1      # save model
+    total_steps += 1      # save metrics (may be skipped)
+
+    pbar = tqdm(total=total_steps, desc="Train pipeline", unit="step")
+    step_durations = []
+    def _update_pbar(t0, label):
+        dt = time.time() - t0
+        step_durations.append(dt)
+        remaining_steps = pbar.total - pbar.n
+        mean_dt = (sum(step_durations) / len(step_durations)) if step_durations else 0.0
+        eta_sec = mean_dt * max(0, remaining_steps)
+        pbar.set_postfix_str(f"{label}={fmt_sec(dt)} | ETA~{fmt_sec(eta_sec)}")
+        pbar.update(1)
+
+    t0 = time.time()
     X_tr_vec = tfidf.fit_transform(X_tr_text)
+    _update_pbar(t0, "vectorize_train")
 
     # 单次拟合（去掉外层 epoch 循环）
     classes = np.arange(len(le.classes_))
@@ -92,6 +140,11 @@ def main(args):
     fit_sec = time.time() - fit_t0
     # SGDClassifier 没有 max_iter 属性? 实际存在，但为参数；此处稳妥打印拟合耗时
     print(f"训练完成，耗时 {fmt_sec(fit_sec)}")
+    # 进度更新：分类器拟合
+    try:
+        _update_pbar(fit_t0, "fit_classifier")
+    except Exception:
+        pass
 
     # 计算训练集损失（仅一次）
     losses = []
@@ -115,7 +168,14 @@ def main(args):
     losses.append(loss_val)
 
     # 评估（eval 集）
-    X_ev_vec = tfidf.transform(X_ev_text_f) if len(X_ev_text_f) > 0 else None
+    X_ev_vec = None
+    if len(X_ev_text_f) > 0:
+        t0 = time.time()
+        X_ev_vec = tfidf.transform(X_ev_text_f)
+        try:
+            _update_pbar(t0, "vectorize_eval")
+        except Exception:
+            pass
     eval_metrics = {}
     if X_ev_vec is not None and len(y_ev) > 0:
         # 可选：概率校准（提升阈值型/开放集判别的可靠性）
@@ -128,11 +188,16 @@ def main(args):
                 print(f"已使用 {args.calibrate} 概率校准（耗时 {fmt_sec(time.time() - calibrate_t0)}）")
                 # 替换管道中的分类器为校准后的版本
                 pipe.named_steps["clf"] = calibrator
+                try:
+                    _update_pbar(calibrate_t0, "calibration")
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[警告] 概率校准失败，将继续使用未校准模型。原因：{e}")
 
         # 使用（可能校准的）分类器进行评估
         clf_for_eval = pipe.named_steps["clf"]
+        t0 = time.time()
         y_pred = clf_for_eval.predict(X_ev_vec)
         acc = accuracy_score(y_ev, y_pred)
         f1w = f1_score(y_ev, y_pred, average="weighted")
@@ -152,6 +217,10 @@ def main(args):
                     y_proba_ev = e / e.sum(axis=1, keepdims=True)
             except Exception:
                 y_proba_ev = None
+        try:
+            _update_pbar(t0, "eval_metrics")
+        except Exception:
+            pass
 
         eval_metrics = {
             "accuracy": round(float(acc), 6),
@@ -209,6 +278,7 @@ def main(args):
 
     # 3) 若 eval 有 OOD 正样本，拟合 LogReg；否则使用MSP分位数阈值回退
     ooc_detector = None
+    ood_t0 = time.time()
     if y_ooc is not None and len(np.unique(y_ooc)) >= 2:
         ooc_clf = LogisticRegression(random_state=42)
         ooc_clf.fit(p_max_ev_all, y_ooc)
@@ -223,8 +293,13 @@ def main(args):
         temperature = float(getattr(args, "ooc_temperature", 20.0))
         ooc_detector = {"kind": "threshold", "tau": tau, "temperature": temperature}
         print(f"OOC detection(Threshold) used: tau(p_max)={tau:.4f} at {getattr(args, 'ooc_tau_percentile', 5.0)}th percentile (no positive OOD)")
+    try:
+        _update_pbar(ood_t0, "fit_ood_detector")
+    except Exception:
+        pass
 
     # 保存 loss 曲线
+    loss_t0 = time.time()
     plt.figure(figsize=(10, 5))
     plt.plot(losses, label='train')
     plt.xlabel('Iteration')
@@ -237,33 +312,51 @@ def main(args):
     plt.close()
     with open(os.path.join(outdir, "loss_data.json"), "w", encoding="utf-8") as f:
         json.dump({"losses": losses}, f, ensure_ascii=False, indent=2)
+    try:
+        _update_pbar(loss_t0, "save_loss")
+    except Exception:
+        pass
 
     # 保存模型
     # 保存模型及未知标签检测器
+    model_t0 = time.time()
     model_bundle = {"model": pipe, "label_encoder": le, "ooc_detector": ooc_detector}
     model_path = os.path.join(args.modelsdir, args.outmodel)
     joblib.dump(model_bundle, model_path)
     print(f"模型已保存到: {model_path}")
+    try:
+        _update_pbar(model_t0, "save_model")
+    except Exception:
+        pass
 
     # 保存评估指标
     if eval_metrics:
+        metrics_t0 = time.time()
         metrics_path = os.path.join(outdir, "metrics_eval.csv")
         pd.DataFrame([eval_metrics]).to_csv(metrics_path, index=False)
         print(f"评估指标已保存到: {metrics_path}")
+        try:
+            _update_pbar(metrics_t0, "save_metrics")
+        except Exception:
+            pass
 
     total_sec = time.time() - global_start
     print(f"=== 训练完成，总耗时：{fmt_sec(total_sec)} ===")
+    try:
+        pbar.close()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-file", type=str, default="train.csv", help="训练集文件名（默认从 outdir 读取）")
     parser.add_argument("--eval-file", type=str, default="eval.csv", help="验证集文件名（默认从 outdir 读取）")
-    parser.add_argument("--outdir", type=str, default="./output", help="输出目录（读取数据与保存训练曲线/指标）")
+    parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_9", help="输出目录（读取数据与保存训练曲线/指标）")
     parser.add_argument("--modelsdir", type=str, default="./models", help="模型保存目录")
-    parser.add_argument("--outmodel", type=str, default="model_best.joblib", help="模型保存文件名")
+    parser.add_argument("--outmodel", type=str, default="9.joblib", help="模型保存文件名")
     parser.add_argument("--max-epochs", type=int, default=100, help="最大迭代轮次")
     parser.add_argument("--patience", type=int, default=5, help="早停耐心值")
-    # 可调向量化/优化参数（为了冲击更高 hit@3 & 稳定概率）
+    # 可调向量化/优化参数
     parser.add_argument("--tfidf-analyzer", type=str, default="char", choices=["char", "char_wb"], help="TF-IDF 分析粒度")
     parser.add_argument("--ngram-min", type=int, default=2, help="ngram 最小长度")
     parser.add_argument("--ngram-max", type=int, default=5, help="ngram 最大长度")

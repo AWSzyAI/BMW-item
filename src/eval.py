@@ -4,8 +4,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score,
-    balanced_accuracy_score, log_loss, roc_auc_score
+    accuracy_score, f1_score
 )
 
 from utils import ensure_single_label, build_text, hit_at_k, eval_split
@@ -438,7 +437,7 @@ def main(args):
             if len(known_indices) == 0:
                 raise ValueError("新文件中没有任何标签出现在已训练的类别中，无法计算分类指标。")
             if len(unknown_indices) > 0:
-                print(f"[new] 注意：共有 {len(unknown_indices)} 条样本的标签不在训练类别中（记为 not_in_train），这些样本被排除在指标计算外。")
+                print(f"[new] 注意：共有 {len(unknown_indices)} 条样本的标签不在训练类别中（记为 not_in_train）")
             m = eval_split(model, le, X_text, y_raw, known_indices)
         results["new"] = m
         print(
@@ -566,10 +565,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--modeldir",type=str,default="./models")
-    parser.add_argument("--model", type=str, default="model_best.joblib",
+    parser.add_argument("--model", type=str, default="8.joblib",
                         help="用于评估的模型文件名，位于 outdir 下")
-    parser.add_argument("--path", type=str,default="m_test.csv")
-    parser.add_argument("--outdir", type=str, default="./output")
+    parser.add_argument("--path", type=str,default="test.csv")
+    parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_8")
     parser.add_argument("--mode", type=str, default="new", choices=["clean", "dirty", "new"],
                         help="评估模式：clean=val+test，dirty=train+val+test，new=对传入文件整体评估")
     parser.add_argument("--map-unknown-to-other", action="store_true", help="在 new 模式下，将未知标签映射为 __OTHER__ 并纳入指标计算（模型需包含该类）")
