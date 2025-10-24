@@ -7,3 +7,4 @@ folder-alias.json
 private-folder-alias.json
 settings.json
 *.joblib
+.vscode/
