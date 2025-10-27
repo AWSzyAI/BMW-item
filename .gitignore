@@ -9,4 +9,4 @@ settings.json
 *.joblib
 .vscode/
 .python-version
-./models/
+/models/
