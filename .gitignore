@@ -8,3 +8,4 @@ private-folder-alias.json
 settings.json
 *.joblib
 .vscode/
+.python-version

@@ -16,5 +16,9 @@ eval:
 predict:
 	uv run src/predict.py --model ${model} --outdir ${outdir} > ./log/${predictlog}
 
+# 删除.gitignore对应的所有内容
+clean:
+
+
 .PHONY: all train eval predict
 

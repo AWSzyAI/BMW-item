@@ -19,7 +19,7 @@
 [new] 样本总数=10654，in_train=10240，not_in_train=414
 [new] 注意：共有 414 条样本的标签不在训练类别中（记为 not_in_train）
 [new]
-acc=0.733 | f1_macro=0.234 | hit@1=0.733 | hit@3=0.807 | hit@5=0.832 | hit@10=0.864
+acc=0.427 | f1_macro=0.057 | hit@1=0.427 | hit@3=0.538 | hit@5=0.575 | hit@10=0.636
 逐样本预测已保存：./output/2025_up_to_month_8/predictions_test.csv
 
 Best model metrics saved to ./output/2025_up_to_month_8/metrics_best_model_all_splits.csv
