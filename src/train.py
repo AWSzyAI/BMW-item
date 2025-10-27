@@ -15,6 +15,58 @@ warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
 
 
+def _read_split_or_combined(base_dir: str, base_filename: str) -> pd.DataFrame:
+    """读取数据集，优先支持 X/Y 分离文件，其次回退到单表 CSV。
+
+    约定：
+    - 若传入 train.csv/test.csv/eval.csv，则优先查找同目录下的 train_X.csv + train_y.csv 等；
+    - X 文件应包含文本特征列：case_title、performed_work（可选 item_title 等）；
+    - y 文件应至少包含 'linked_items' 列。
+    返回值为合并后的 DataFrame（X 列 + linked_items 列）。
+    """
+    # 绝对路径优先，其次 base_dir 拼接
+    def _cand(p: str) -> str | None:
+        return p if (p and os.path.isabs(p) and os.path.exists(p)) else None
+
+    # 计算 stem（去掉 .csv 和可能的 _X/_y 后缀）
+    name = os.path.basename(base_filename)
+    stem = os.path.splitext(name)[0]
+    if stem.endswith("_X"):
+        stem = stem[:-2]
+    if stem.endswith("_y"):
+        stem = stem[:-2]
+
+    # 可能的文件名
+    x_name = f"{stem}_X.csv"
+    y_name = f"{stem}_y.csv"
+
+    # 1) 绝对路径的 X/Y
+    x_abs = _cand(base_filename)  # 若本身就是一个存在的绝对路径（很少见）
+    if x_abs and x_abs.endswith("_X.csv"):
+        y_abs = x_abs[:-6] + "_y.csv"
+        if os.path.exists(y_abs):
+            X_df = pd.read_csv(x_abs)
+            y_df = pd.read_csv(y_abs)
+            if "linked_items" not in y_df.columns:
+                raise KeyError(f"{y_abs} 缺少列：linked_items")
+            df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+            return df
+
+    # 2) base_dir 下的 X/Y
+    x_path = os.path.join(base_dir, x_name)
+    y_path = os.path.join(base_dir, y_name)
+    if os.path.exists(x_path) and os.path.exists(y_path):
+        X_df = pd.read_csv(x_path)
+        y_df = pd.read_csv(y_path)
+        if "linked_items" not in y_df.columns:
+            raise KeyError(f"{y_path} 缺少列：linked_items")
+        df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+        return df
+
+    # 3) 回退：读取单表 CSV（绝对路径优先，再 base_dir）
+    return _flex_read_csv(base_dir, base_filename)
+
+
 class LossCallback:
     """记录并计算训练损失的简单回调（用于兼容旧模型反序列化）。
 
@@ -44,9 +96,9 @@ def main(args):
     os.makedirs(args.outdir, exist_ok=True)
     os.makedirs(args.modelsdir, exist_ok=True)
 
-    # 读取 train / eval 数据
-    df_tr = _flex_read_csv(args.outdir, args.train_file)
-    df_ev = _flex_read_csv(args.outdir, args.eval_file)
+    # 读取 train / eval 数据（优先 X/Y 分离，再回退单表）
+    df_tr = _read_split_or_combined(args.outdir, args.train_file)
+    df_ev = _read_split_or_combined(args.outdir, args.eval_file)
     for df_name, df in [("train", df_tr), ("eval", df_ev)]:
         for col in ["case_title", "performed_work", "linked_items"]:
             if col not in df.columns:
@@ -440,10 +492,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-file", type=str, default="train.csv", help="训练集文件名（默认从 outdir 读取）")
     parser.add_argument("--eval-file", type=str, default="eval.csv", help="验证集文件名（默认从 outdir 读取）")
-    parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_9", help="输出目录（读取数据与保存训练曲线/指标）")
+    parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_2", help="输出目录（读取数据与保存训练曲线/指标）")
     parser.add_argument("--modelsdir", type=str, default="./models", help="模型保存目录")
     parser.add_argument("--outmodel", type=str, default="9.joblib", help="模型保存文件名")
-    parser.add_argument("--max-epochs", type=int, default=100, help="最大迭代轮次")
+    parser.add_argument("--max-epochs", type=int, default=1000, help="最大迭代轮次")
     parser.add_argument("--patience", type=int, default=5, help="早停耐心值（若连续 N 个 epoch 未提升则停止）")
     parser.add_argument("--batch-size", type=int, default=1024, help="增量训练的 batch 大小")
     parser.add_argument("--shuffle", action="store_true", help="每个 epoch 打乱样本")

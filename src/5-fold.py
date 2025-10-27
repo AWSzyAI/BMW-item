@@ -7,7 +7,8 @@
     选择某一个 fold 作为 eval，其余作为 train；
 - 或者按比例（train_ratio）进行分层切分（兼容旧行为）。
 
-输出：在 --outdir 下生成 train.csv 与 eval.csv（可选 test.csv 见旧 3-way 模式）。
+输出：在 --outdir 下生成分离文件：train_X.csv/train_y.csv、eval_X.csv/eval_y.csv（ratio=3 时额外 test_X.csv/test_y.csv）。
+为保持兼容，也会同时写出 train.csv 与 eval.csv（以及需要时的 test.csv）。
 
 用法示例：
     # 使用 5 折并选择第 0 折为 eval
@@ -39,11 +40,50 @@ def ensure_single_label(s):
 
 
 def read_input(path: str, outdir: str) -> pd.DataFrame:
-    candidates = [path, os.path.join(outdir, path)]
-    for p in candidates:
-        if p and os.path.exists(p):
-            return pd.read_csv(p)
-    raise FileNotFoundError(f"找不到输入文件：{path} 或 {os.path.join(outdir, path)}")
+    """读取输入数据。
+
+    支持两类输入：
+    1) 目录：目录下应包含 X.csv 与 y.csv（y.csv 至少包含列 linked_items），将二者横向合并后作为输入；
+    2) 文件：按 CSV 读取（兼容旧单表）。
+    同时支持相对路径（会在 outdir 下拼接）与绝对路径。
+    """
+
+    def _read_from_dir(dir_path: str) -> pd.DataFrame | None:
+        if not os.path.isdir(dir_path):
+            return None
+        x_file = os.path.join(dir_path, "X_train.csv")
+        y_file = os.path.join(dir_path, "y_train.csv")
+        if os.path.exists(x_file) and os.path.exists(y_file):
+            X_df = pd.read_csv(x_file)
+            y_df = pd.read_csv(y_file)
+            if "linked_items" not in y_df.columns:
+                raise KeyError(f"{y_file} 缺少列：linked_items")
+            df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+            return df
+        # 目录存在但缺少文件
+        raise FileNotFoundError(f"目录 {dir_path} 下未找到 X.csv 与 y.csv，请检查输入目录内容。")
+
+    # 1) 绝对路径优先
+    if path and os.path.isabs(path):
+        if os.path.isdir(path):
+            return _read_from_dir(path)
+        if os.path.exists(path):
+            return pd.read_csv(path)
+
+    # 2) 原样路径（可能是相对路径，若直接存在则读取；若是目录则按目录处理）
+    if path and os.path.exists(path):
+        if os.path.isdir(path):
+            return _read_from_dir(path)
+        return pd.read_csv(path)
+
+    # 3) 尝试在 outdir 下拼接
+    joined = os.path.join(outdir, path)
+    if os.path.isdir(joined):
+        return _read_from_dir(joined)
+    if os.path.exists(joined):
+        return pd.read_csv(joined)
+
+    raise FileNotFoundError(f"找不到输入：{path}，也无法在 {outdir} 下找到对应的文件或目录。")
 
 
 def main(args):
@@ -75,6 +115,22 @@ def main(args):
 
     # 方法选择：kfold 或 比例切分
     method = str(getattr(args, "method", "kfold")).lower()
+    # 小工具：写出分离文件 + 兼容的单表
+    def _save_split(df_split: pd.DataFrame, name: str):
+        out_single = os.path.join(args.outdir, f"{name}.csv")
+        # 分离：X（去除 linked_items）和 y（仅 linked_items）
+        if "linked_items" not in df_split.columns:
+            raise KeyError("内部错误：分割后的数据缺少 linked_items 列")
+        X_df = df_split.drop(columns=["linked_items"]) if df_split.shape[1] > 1 else pd.DataFrame(index=df_split.index)
+        y_df = df_split[["linked_items"]].copy()
+        X_path = os.path.join(args.outdir, f"{name}_X.csv")
+        Y_path = os.path.join(args.outdir, f"{name}_y.csv")
+        # 保存
+        df_split.to_csv(out_single, index=False, encoding="utf-8-sig")
+        X_df.to_csv(X_path, index=False, encoding="utf-8-sig")
+        y_df.to_csv(Y_path, index=False, encoding="utf-8-sig")
+        return out_single, X_path, Y_path
+
     if method == "kfold":
         k = int(getattr(args, "k", 5))
         fold_index = int(getattr(args, "fold_index", 0))
@@ -97,11 +153,11 @@ def main(args):
         tr_idx, ev_idx = splits[fold_index]
         df_train = df.iloc[tr_idx].reset_index(drop=True)
         df_eval = df.iloc[ev_idx].reset_index(drop=True)
-        out_eval = os.path.join(args.outdir, "eval.csv")
-        out_train = os.path.join(args.outdir, "train.csv")
-        df_train.to_csv(out_train, index=False, encoding="utf-8-sig")
-        df_eval.to_csv(out_eval, index=False, encoding="utf-8-sig")
-        print(f"[kfold] Saved: {out_train} ({len(df_train)}) | {out_eval} ({len(df_eval)}) | k={k}, fold={fold_index}")
+        tr_single, tr_X, tr_y = _save_split(df_train, "train")
+        ev_single, ev_X, ev_y = _save_split(df_eval, "eval")
+        print(
+            f"[kfold] Saved: train({len(df_train)}) -> {tr_X}, {tr_y} | eval({len(df_eval)}) -> {ev_X}, {ev_y} | also single: {tr_single}, {ev_single} | k={k}, fold={fold_index}"
+        )
     else:
         # 兼容旧逻辑：按比例分层 + 可选 3 路切分
         rng = pd.Series(range(len(df))).sample(frac=1.0, random_state=args.seed).index  # for stable shuffle order
@@ -147,16 +203,26 @@ def main(args):
 
         df_train = df.iloc[sorted(train_idx)].reset_index(drop=True)
         df_eval  = df.iloc[sorted(eval_idx)].reset_index(drop=True)
-        out_eval = os.path.join(args.outdir, "eval.csv")
-        out_train = os.path.join(args.outdir, "train.csv")
-        df_train.to_csv(out_train, index=False, encoding="utf-8-sig")
-        df_eval.to_csv(out_eval, index=False, encoding="utf-8-sig")
-        print(f"[ratio] Saved: {out_train} ({len(df_train)}) | {out_eval} ({len(df_eval)}) | train_ratio={train_ratio}")
+        tr_single, tr_X, tr_y = _save_split(df_train, "train")
+        ev_single, ev_X, ev_y = _save_split(df_eval, "eval")
+        msg = [
+            f"train({len(df_train)}) -> {tr_X}, {tr_y}",
+            f"eval({len(df_eval)}) -> {ev_X}, {ev_y}"
+        ]
+        # 若是 3 路切分，额外输出 test
+        if str(getattr(args, "split_type", "2")).strip() == "3" and len(test_idx) > 0:
+            df_test = df.iloc[sorted(test_idx)].reset_index(drop=True)
+            ts_single, ts_X, ts_y = _save_split(df_test, "test")
+            msg.append(f"test({len(df_test)}) -> {ts_X}, {ts_y}")
+            msg.append(f"also single: {tr_single}, {ev_single}, {ts_single}")
+        else:
+            msg.append(f"also single: {tr_single}, {ev_single}")
+        print(f"[ratio] Saved: {' | '.join(msg)} | train_ratio={train_ratio}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, default="./output/2025_up_to_month_7/train_eval.csv", help="输入 CSV 文件路径（绝对或相对）")
+    parser.add_argument("--path", type=str, default="./output/2025_up_to_month_2", help="输入路径：可为 CSV 文件，或包含 X.csv 与 y.csv 的文件夹")
     parser.add_argument("--outdir", type=str, default="./output", help="输出目录")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--min_count", type=int, default=5, help="少见标签阈值与最低样本数要求（建议与 k 相同）")

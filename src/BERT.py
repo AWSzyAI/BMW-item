@@ -21,6 +21,27 @@ from transformers import (
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
 
 
+# # Load model directly
+# from transformers import AutoTokenizer, AutoModelForMaskedLM
+
+# tokenizer = AutoTokenizer.from_pretrained("/home/szy/bmw/2025-10-27/BMW-item/models/bert-base-chinese")
+# model = AutoModelForMaskedLM.from_pretrained("/home/szy/bmw/2025-10-27/BMW-item/models/bert-base-chinese")
+
+def _is_valid_local_hf_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    needed = [
+        os.path.join(path, "config.json"),
+    ]
+    has_tokenizer = any(
+        os.path.exists(os.path.join(path, name))
+        for name in ["tokenizer.json", "vocab.txt"]
+    )
+    if not has_tokenizer:
+        return False
+    return all(os.path.exists(p) for p in needed)
+
+
 def _choose_label_column(df: pd.DataFrame) -> str:
     # 优先级：extend_id > linked_items > item_title
     for col in ["extend_id", "linked_items", "item_title"]:
@@ -118,8 +139,25 @@ def main(args: argparse.Namespace) -> None:
     # Tokenizer & Model
     # 支持从本地 models/ 目录加载：优先使用 --init-hf-dir；否则使用 --bert-model（可为本地目录或模型名）
     init_path = getattr(args, "init_hf_dir", None) or args.bert_model
-    # 纯离线友好：local_files_only=True（若本地不存在会报错，避免意外联网）
-    tokenizer = AutoTokenizer.from_pretrained(init_path, local_files_only=True)
+    is_local = os.path.isdir(init_path)
+    allow_online = bool(getattr(args, "allow_online", False))
+
+    if is_local:
+        if not _is_valid_local_hf_dir(init_path):
+            raise RuntimeError(
+                f"本地模型目录不完整：{init_path}\n"
+                f"请确保包含至少 config.json 与 tokenizer.json 或 vocab.txt。\n"
+                f"可以先用 huggingface_hub.snapshot_download 下载到本地再指定 --init-hf-dir。"
+            )
+        tokenizer = AutoTokenizer.from_pretrained(init_path, local_files_only=True)
+    else:
+        if not allow_online:
+            raise RuntimeError(
+                "未提供本地模型目录且禁用了联网下载。请使用以下其一：\n"
+                "1) 先将模型离线下载到本地，并通过 --init-hf-dir 指向该目录；\n"
+                "2) 运行时添加 --allow-online，并可设置 HF_ENDPOINT=https://hf-mirror.com 与清理代理环境以加速与避免解析失败。"
+            )
+        tokenizer = AutoTokenizer.from_pretrained(init_path, local_files_only=False)
     num_labels = len(le.classes_)
     # 设备与混精度：仅在 CUDA 可用时启用 fp16
     device = (
@@ -128,12 +166,20 @@ def main(args: argparse.Namespace) -> None:
     use_fp16 = bool(args.fp16) and device == "cuda"
 
     # 若 init_path 分类头维度与当前任务标签数不一致，使用 ignore_mismatched_sizes 自动重建分类头
-    model = AutoModelForSequenceClassification.from_pretrained(
-        init_path,
-        num_labels=num_labels,
-        ignore_mismatched_sizes=True,
-        local_files_only=True,
-    )
+    if is_local:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            init_path,
+            num_labels=num_labels,
+            ignore_mismatched_sizes=True,
+            local_files_only=True,
+        )
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            init_path,
+            num_labels=num_labels,
+            ignore_mismatched_sizes=True,
+            local_files_only=False,
+        )
     model.to(device)
 
     # 编码
@@ -276,7 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--outmodel", type=str, default="9.joblib")
     # BERT 参数
     parser.add_argument("--bert-model", type=str, default="/home/szy/bmw/2025-10-27/BMW-item/models/bert-base-chinese")
-    parser.add_argument("--init-hf-dir", type=str, default=None, help="从本地 HF 目录初始化（覆盖 --bert-model），支持继续微调")
+    parser.add_argument("--init-hf-dir", type=str, default="/home/szy/bmw/2025-10-27/BMW-item/models/bert-base-chinese", help="从本地 HF 目录初始化（覆盖 --bert-model），支持继续微调")
     parser.add_argument("--num-train-epochs", dest="num_train_epochs", type=float, default=2.0)
     parser.add_argument("--train-batch-size", type=int, default=16)
     parser.add_argument("--eval-batch-size", type=int, default=32)

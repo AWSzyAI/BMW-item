@@ -8,6 +8,57 @@ from sklearn.metrics import (
 )
 
 from utils import ensure_single_label, build_text, hit_at_k, eval_split
+
+
+def _read_split_or_combined(outdir: str, base: str) -> tuple[pd.DataFrame, str]:
+    """读取评估数据，优先支持 X/Y 分离文件（<stem>_X.csv + <stem>_y.csv），否则回退到单表。
+
+    返回：
+    - df: 合并后的 DataFrame（包含文本列和 linked_items，如果 y 不存在则不包含 linked_items）
+    - used_base_name: 用于生成输出文件名的基础名（stem 或原文件名去扩展名）
+    """
+    # 绝对优先：若给的是绝对路径的 _X.csv，则尝试旁边的 _y.csv
+    if base and os.path.isabs(base) and os.path.exists(base):
+        stem = os.path.splitext(os.path.basename(base))[0]
+        if stem.endswith("_X"):
+            y_abs = base[:-6] + "_y.csv"
+            if os.path.exists(y_abs):
+                X_df = pd.read_csv(base)
+                y_df = pd.read_csv(y_abs)
+                if "linked_items" not in y_df.columns:
+                    raise KeyError(f"{y_abs} 缺少列：linked_items")
+                df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+                return df, stem[:-2]
+        # 若是单表绝对路径
+        df = pd.read_csv(base)
+        used = os.path.splitext(os.path.basename(base))[0]
+        return df, used
+
+    # 相对文件名：尝试 outdir 下的 <stem>_X/_y
+    name = os.path.basename(base)
+    stem = os.path.splitext(name)[0]
+    if stem.endswith("_X"):
+        stem = stem[:-2]
+    if stem.endswith("_y"):
+        stem = stem[:-2]
+    x_path = os.path.join(outdir, f"{stem}_X.csv")
+    y_path = os.path.join(outdir, f"{stem}_y.csv")
+    if os.path.exists(x_path) and os.path.exists(y_path):
+        X_df = pd.read_csv(x_path)
+        y_df = pd.read_csv(y_path)
+        if "linked_items" not in y_df.columns:
+            raise KeyError(f"{y_path} 缺少列：linked_items")
+        df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+        return df, stem
+
+    # 回退：原始单表（优先绝对路径参数，其次 outdir/path）
+    read_candidates = [base, os.path.join(outdir, base)]
+    for p in read_candidates:
+        if p and os.path.exists(p):
+            df = pd.read_csv(p)
+            used = os.path.splitext(os.path.basename(p))[0]
+            return df, used
+    raise FileNotFoundError(f"找不到评估数据文件：{base} 或 {os.path.join(outdir, base)} 或其分离版 X/Y")
 # def ensure_single_label(s):
 #     if isinstance(s, list):
 #         return str(s[0]) if s else ""
@@ -48,33 +99,21 @@ def main(args):
     # mode: new,dirty,clean
     mode = args.mode
     
-    # path 参数有歧义，有时是在outdir之下，有时是完整路径
-    # 读取数据文件：优先按给定路径，其次在 outdir/path
-    read_candidates = [path, os.path.join(outdir, path)]
-    file_to_read = None
-    for p in read_candidates:
-        if p and os.path.exists(p):
-            file_to_read = p
-            break
-    if file_to_read is None:
-        # 回退到旧逻辑（按 outdir 拼接），保留原有行为的错误信息
-        file_to_read = os.path.join(outdir, path)
-        if not os.path.exists(file_to_read):
-            raise FileNotFoundError(f"找不到评估数据文件：{path} 或 {file_to_read}")
-
-
-
-    df = pd.read_csv(file_to_read)
+    # 读取数据（支持 X/Y 分离或单表）
+    df, used_base = _read_split_or_combined(outdir, path)
     # check X,y
     # X: case_title + performed_work, (case_submitted_date)//data有什么用呢？预测未来的故障趋势？根据季节/型号发售时间来检测集中爆发的故障？
     # y: linked_items, (item_title)//目前为止item_title还没有被用起来
 
-    for col in ["case_title", "performed_work", "linked_items"]:
+    # 校验特征与标签列（若无 y 列，将在 new 模式下报错）
+    for col in ["case_title", "performed_work"]:
         if col not in df.columns:
-            raise KeyError(f"{file_to_read} 缺少列：{col}")
-    df["linked_items"] = df["linked_items"].apply(ensure_single_label).astype(str)
+            raise KeyError(f"输入缺少列：{col}")
+    has_y = ("linked_items" in df.columns)
+    if has_y:
+        df["linked_items"] = df["linked_items"].apply(ensure_single_label).astype(str)
     X_text = build_text(df).tolist()
-    y_raw  = df["linked_items"].astype(str).tolist()
+    y_raw  = (df["linked_items"].astype(str).tolist() if has_y else [])
 
     # 加载最优模型
     modeldir = args.modeldir
@@ -90,6 +129,8 @@ def main(args):
     results = {}
 
     if mode == "new":
+        if not has_y:
+            raise KeyError("在 new 模式下需要提供标签文件 *_y.csv（包含 linked_items）。")
         # new 模式：对整文件进行评估。
         # 先给出数据与训练类别的对照描述：训练集类别集合 vs 本次评估文件（视作测试集）的标签集合
         try:
@@ -396,7 +437,7 @@ def main(args):
                         "hit@10": _hit_k(i, 10),
                     })
                 pred_df = pd.DataFrame(rows)
-                base = os.path.splitext(os.path.basename(file_to_read))[0]
+                base = used_base
                 pred_out = os.path.join(outdir, f"predictions_{base}.csv")
                 pred_df.to_csv(pred_out, index=False, encoding="utf-8-sig")
                 print(f"逐样本预测已保存：{pred_out}")
@@ -488,7 +529,7 @@ def main(args):
             })
 
         pred_df = pd.DataFrame(rows)
-        base = os.path.splitext(os.path.basename(file_to_read))[0]
+        base = used_base
         pred_out = os.path.join(outdir, f"predictions_{base}.csv")
         pred_df.to_csv(pred_out, index=False, encoding="utf-8-sig")
         print(f"逐样本预测已保存：{pred_out}")
@@ -567,7 +608,7 @@ if __name__ == "__main__":
     parser.add_argument("--modeldir",type=str,default="./models")
     parser.add_argument("--model", type=str, default="8.joblib",
                         help="用于评估的模型文件名，位于 outdir 下")
-    parser.add_argument("--path", type=str,default="test.csv")
+    parser.add_argument("--path", type=str,default="eval.csv")
     parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_8")
     parser.add_argument("--mode", type=str, default="new", choices=["clean", "dirty", "new"],
                         help="评估模式：clean=val+test，dirty=train+val+test，new=对传入文件整体评估")

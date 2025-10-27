@@ -17,3 +17,4 @@ epoch=15/100 loss=4.138747
 epoch=16/100 loss=4.134704
 epoch=17/100 loss=4.153257
 epoch=18/100 loss=4.149237
+epoch=19/100 loss=4.126841

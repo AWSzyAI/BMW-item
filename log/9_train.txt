@@ -1,3 +1,11 @@
 === 模型训练开始（使用 train.csv / eval.csv）===
-已复制 665 个单样本类别，以平衡训练集。
-[警告] eval 中有 151 条样本的标签未在训练集中出现（记为 not_in_train）
+epoch=1/1000 loss=2.102932
+epoch=2/1000 loss=1.999615
+epoch=3/1000 loss=1.958262
+epoch=4/1000 loss=1.933249
+epoch=5/1000 loss=1.915348
+epoch=6/1000 loss=1.901384
+epoch=7/1000 loss=1.889919
+epoch=8/1000 loss=1.880189
+epoch=9/1000 loss=1.871735
+epoch=10/1000 loss=1.864262

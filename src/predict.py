@@ -58,10 +58,46 @@ def main(args):
     le = bundle["label_encoder"]
     ooc_detector = bundle.get("ooc_detector")
 
-    # 读取输入样本
+    # 读取输入样本（支持 *_X.csv + *_y.csv 分离，或单表）
     outdir = args.outdir
     infile = args.infile if args.infile else args.path  # 兼容旧参数 --path
-    df = _flex_read_csv(outdir, infile)
+
+    def _read_split_or_combined(base_dir: str, base: str) -> pd.DataFrame:
+        # 若是绝对路径且存在且为 *_X.csv，优先寻找旁边的 *_y.csv
+        if base and os.path.isabs(base) and os.path.exists(base):
+            stem = os.path.splitext(os.path.basename(base))[0]
+            if stem.endswith("_X"):
+                y_abs = base[:-6] + "_y.csv"
+                if os.path.exists(y_abs):
+                    X_df = pd.read_csv(base)
+                    y_df = pd.read_csv(y_abs)
+                    if "linked_items" in y_df.columns:
+                        return pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+                    else:
+                        # 没有标签也允许，仅用于展示文本
+                        return X_df.reset_index(drop=True)
+            # 单表绝对路径
+            return pd.read_csv(base)
+
+        name = os.path.basename(base)
+        stem = os.path.splitext(name)[0]
+        if stem.endswith("_X"):
+            stem = stem[:-2]
+        if stem.endswith("_y"):
+            stem = stem[:-2]
+        x_path = os.path.join(base_dir, f"{stem}_X.csv")
+        y_path = os.path.join(base_dir, f"{stem}_y.csv")
+        if os.path.exists(x_path):
+            X_df = pd.read_csv(x_path)
+            if os.path.exists(y_path):
+                y_df = pd.read_csv(y_path)
+                if "linked_items" in y_df.columns:
+                    return pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+            return X_df.reset_index(drop=True)
+        # 回退到单表
+        return _flex_read_csv(base_dir, base)
+
+    df = _read_split_or_combined(outdir, infile)
     texts = build_text(df).tolist()
     if len(texts) == 0:
         raise ValueError("输入文件为空或无法构造文本。")

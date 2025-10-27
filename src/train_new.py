@@ -6,7 +6,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     # 通用参数（与现有 train.py/BERT.py 对齐）
-    parser.add_argument("--strategy", type=str, default="tfidf", choices=["tfidf", "bert"], help="训练策略：tfidf 或 bert")
+    parser.add_argument("--strategy", type=str, default="bert", choices=["tfidf", "bert"], help="训练策略：tfidf 或 bert")
     parser.add_argument("--train-file", type=str, default="train.csv")
     parser.add_argument("--eval-file", type=str, default="eval.csv")
     parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_9")
@@ -43,14 +43,15 @@ def main():
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--save-hf-dir", type=str, default=None)
+    parser.add_argument("--allow-online", action="store_true",default=False, help="允许在线从 Hugging Face 下载模型")
 
     args = parser.parse_args()
 
     if args.strategy == "tfidf":
-        from src.tf_idf import train_tfidf
+        from tf_idf import train_tfidf
 
         train_tfidf(args)
-    else:
+    elif args.strategy == "bert":
         from BERT import main as bert_main
 
         bert_main(args)
