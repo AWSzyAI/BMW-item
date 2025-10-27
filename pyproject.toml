@@ -12,4 +12,13 @@ dependencies = [
     "openai>=2.6.0",
     "pandas>=2.3.3",
     "scikit-learn>=1.7.2",
+    "torch>=2.4.0",
+    "transformers>=4.44.0",
+    "accelerate>=0.34.0",
+    "datasets>=2.21.0",
+    "huggingface-hub>=0.36.0",
 ]
+
+# 注：在无 GPU 的机器上，请使用 uv 的临时安装命令为 CPU 安装 torch：
+#   uv pip install --index-url https://download.pytorch.org/whl/cpu torch --upgrade
+# 这样避免下载 CUDA 相关的大体积依赖。

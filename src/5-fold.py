@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-按标签分层拆分数据，输出 train.csv / eval.csv / test.csv。
-规则：
-- 先将标签列 linked_items 规范为单标签字符串；
-- 过滤掉样本数 < 5 的类别（确保每个 y 至少 5 个样本）；
-- 对于每个类别，随机选取 1 个样本作为 test，另选 1 个不同样本作为 eval，其余归为 train；
-- 输出到 --outdir 目录下：train.csv, eval.csv, test.csv。
+分层切分工具：支持 5-fold（或 K-fold）与按比例的分层切分。
+
+主要用途：
+- 对输入 CSV（或 outdir/path）进行标签规范化后，执行 StratifiedKFold 切分，
+    选择某一个 fold 作为 eval，其余作为 train；
+- 或者按比例（train_ratio）进行分层切分（兼容旧行为）。
+
+输出：在 --outdir 下生成 train.csv 与 eval.csv（可选 test.csv 见旧 3-way 模式）。
 
 用法示例：
-  python ./src/5-fold.py --path ./output/df_filtered_xxx.csv --outdir ./output --seed 42
+    # 使用 5 折并选择第 0 折为 eval
+    uv run python ./src/5-fold.py --path ./output/2025_up_to_month_9/train_all.csv \
+            --outdir ./output/2025_up_to_month_9 --method kfold --k 5 --fold-index 0 --seed 42
 """
 import os
 import ast
 import argparse
 import pandas as pd
+from sklearn.model_selection import StratifiedKFold
 from collections import defaultdict
 
 
@@ -68,85 +73,100 @@ def main(args):
     if df.empty:
         raise ValueError("过滤/映射后数据为空，请检查标签分布或降低阈值。")
 
-    # 分层拆分
-    rng = pd.Series(range(len(df))).sample(frac=1.0, random_state=args.seed).index  # for stable shuffle order
-    df = df.loc[rng].reset_index(drop=True)
+    # 方法选择：kfold 或 比例切分
+    method = str(getattr(args, "method", "kfold")).lower()
+    if method == "kfold":
+        k = int(getattr(args, "k", 5))
+        fold_index = int(getattr(args, "fold_index", 0))
+        if not (0 <= fold_index < k):
+            raise ValueError(f"fold_index 必须在 [0,{k-1}] 区间")
+        # 检查每类样本数 >= k
+        counts2 = df["linked_items"].value_counts()
+        insufficient = counts2[counts2 < k]
+        if len(insufficient) > 0:
+            print(f"[警告] 以下类别样本数 < k={k}，将被移除：{list(insufficient.index)[:10]} ...")
+            df = df[df["linked_items"].isin(counts2[counts2 >= k].index)].reset_index(drop=True)
+            if df.empty:
+                raise ValueError("移除稀有类别后数据为空，请降低 k 或放宽 min_count。")
 
-    label_to_rows = defaultdict(list)
-    for i, y in enumerate(df["linked_items"].tolist()):
-        label_to_rows[y].append(i)
-
-    test_idx, eval_idx, train_idx = [], [], []
-    split_type = str(getattr(args, "split_type", "2")).strip()
-    train_ratio = float(getattr(args, "train_ratio", 0.8))
-    if not (0.0 < train_ratio < 1.0):
-        raise ValueError("train_ratio 必须在 (0,1) 区间，例如 0.8 代表 4:1 切分")
-    for y, idxs in label_to_rows.items():
-        if len(idxs) < min_count:
-            # 理论上不会发生（已过滤），防御性判断
-            continue
-        if split_type == "3":
-            # 先取 1 个样本作为 test，剩余按 4:1（train:eval）比例切分
-            t = idxs[0]
-            rem = idxs[1:]
-            n = len(rem)
-            if n <= 1:
-                # 极端情况兜底
-                test_idx.append(t)
-                train_idx.extend(rem)
-                continue
-            n_eval = max(1, int(round(n * (1 - train_ratio))))
-            n_eval = min(n_eval, n - 1)
-            e = rem[:n_eval]
-            tr = rem[n_eval:]
-            test_idx.append(t)
-            eval_idx.extend(e)
-            train_idx.extend(tr)
-        else:
-            # 2 分法：全量按 4:1（train:eval）比例切分
-            n = len(idxs)
-            if n <= 1:
-                train_idx.extend(idxs)
-                continue
-            n_eval = max(1, int(round(n * (1 - train_ratio))))
-            n_eval = min(n_eval, n - 1)
-            e = idxs[:n_eval]
-            tr = idxs[n_eval:]
-            eval_idx.extend(e)
-            train_idx.extend(tr)
-
-    # 构造并保存
-    
-    df_train = df.iloc[sorted(train_idx)].reset_index(drop=True)
-    df_eval  = df.iloc[sorted(eval_idx)].reset_index(drop=True) 
-    if split_type == "3":
-        df_test = df.iloc[sorted(test_idx)].reset_index(drop=True)
-    out_eval = os.path.join(args.outdir, "eval.csv") 
-    out_train = os.path.join(args.outdir, "train.csv")
-    out_test = os.path.join(args.outdir, "test.csv") if split_type == "3" else None
-    
-
-    df_train.to_csv(out_train, index=False, encoding="utf-8-sig")
-    if out_eval is not None and df_eval is not None:
+        X_idx = pd.Series(range(len(df)))
+        y = df["linked_items"].astype(str).values
+        skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=args.seed)
+        # 选择指定折为 eval，其余为 train
+        splits = list(skf.split(X_idx, y))
+        tr_idx, ev_idx = splits[fold_index]
+        df_train = df.iloc[tr_idx].reset_index(drop=True)
+        df_eval = df.iloc[ev_idx].reset_index(drop=True)
+        out_eval = os.path.join(args.outdir, "eval.csv")
+        out_train = os.path.join(args.outdir, "train.csv")
+        df_train.to_csv(out_train, index=False, encoding="utf-8-sig")
         df_eval.to_csv(out_eval, index=False, encoding="utf-8-sig")
-    if out_test is not None and df_test is not None:
-        df_test.to_csv(out_test, index=False, encoding="utf-8-sig")
+        print(f"[kfold] Saved: {out_train} ({len(df_train)}) | {out_eval} ({len(df_eval)}) | k={k}, fold={fold_index}")
+    else:
+        # 兼容旧逻辑：按比例分层 + 可选 3 路切分
+        rng = pd.Series(range(len(df))).sample(frac=1.0, random_state=args.seed).index  # for stable shuffle order
+        df = df.loc[rng].reset_index(drop=True)
+        label_to_rows = defaultdict(list)
+        for i, yv in enumerate(df["linked_items"].tolist()):
+            label_to_rows[yv].append(i)
 
-    print(f"Saved: {out_train} ({len(df_train)} rows)")
-    if out_eval is not None and df_eval is not None:
-        print(f"Saved: {out_eval} ({len(df_eval)} rows)")
-    if out_test is not None and df_test is not None:
-        print(f"Saved: {out_test} ({len(df_test)} rows)")
+        test_idx, eval_idx, train_idx = [], [], []
+        split_type = str(getattr(args, "split_type", "2")).strip()
+        train_ratio = float(getattr(args, "train_ratio", 0.8))
+        if not (0.0 < train_ratio < 1.0):
+            raise ValueError("train_ratio 必须在 (0,1) 区间，例如 0.8 代表 4:1 切分")
+        for yv, idxs in label_to_rows.items():
+            if len(idxs) < min_count:
+                continue
+            if split_type == "3":
+                t = idxs[0]
+                rem = idxs[1:]
+                n = len(rem)
+                if n <= 1:
+                    test_idx.append(t)
+                    train_idx.extend(rem)
+                    continue
+                n_eval = max(1, int(round(n * (1 - train_ratio))))
+                n_eval = min(n_eval, n - 1)
+                e = rem[:n_eval]
+                tr = rem[n_eval:]
+                test_idx.append(t)
+                eval_idx.extend(e)
+                train_idx.extend(tr)
+            else:
+                n = len(idxs)
+                if n <= 1:
+                    train_idx.extend(idxs)
+                    continue
+                n_eval = max(1, int(round(n * (1 - train_ratio))))
+                n_eval = min(n_eval, n - 1)
+                e = idxs[:n_eval]
+                tr = idxs[n_eval:]
+                eval_idx.extend(e)
+                train_idx.extend(tr)
+
+        df_train = df.iloc[sorted(train_idx)].reset_index(drop=True)
+        df_eval  = df.iloc[sorted(eval_idx)].reset_index(drop=True)
+        out_eval = os.path.join(args.outdir, "eval.csv")
+        out_train = os.path.join(args.outdir, "train.csv")
+        df_train.to_csv(out_train, index=False, encoding="utf-8-sig")
+        df_eval.to_csv(out_eval, index=False, encoding="utf-8-sig")
+        print(f"[ratio] Saved: {out_train} ({len(df_train)}) | {out_eval} ({len(df_eval)}) | train_ratio={train_ratio}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, default="./output/m_train_eval.csv", help="输入 CSV 文件路径（绝对或相对）")
+    parser.add_argument("--path", type=str, default="./output/2025_up_to_month_7/train_eval.csv", help="输入 CSV 文件路径（绝对或相对）")
     parser.add_argument("--outdir", type=str, default="./output", help="输出目录")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--min_count", type=int, default=5, help="少见标签阈值与最低样本数要求")
+    parser.add_argument("--min_count", type=int, default=5, help="少见标签阈值与最低样本数要求（建议与 k 相同）")
     parser.add_argument("--map_rare_to_other", action="store_true", help="将少见标签映射为 __OTHER__")
-    parser.add_argument("--split_type", type=str, default="2", help="3=每类先取1条test，剩余按比例切成train/eval；2=仅按比例切成train/eval")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="train:eval 的比例（默认 0.8，即 4:1）")
+    # 新增：kfold 参数
+    parser.add_argument("--method", type=str, default="kfold", choices=["kfold", "ratio"], help="切分方法：kfold 或 ratio")
+    parser.add_argument("--k", type=int, default=5, help="kfold 的折数")
+    parser.add_argument("--fold-index", dest="fold_index", type=int, default=0, help="作为 eval 的折编号 [0..k-1]")
+    # 兼容旧的 2/3 分法
+    parser.add_argument("--split_type", type=str, default="2", help="ratio 模式下：3=每类先取1条test，剩余按比例切成train/eval；2=仅按比例切成train/eval")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="ratio 模式下：train:eval 的比例（默认 0.8，即 4:1）")
     args = parser.parse_args()
     main(args)

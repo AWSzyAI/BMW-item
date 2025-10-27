@@ -1,11 +1,14 @@
-month=8
+month=7
 outdir=./output/2025_up_to_month_${month}
 model=${month}.joblib
 trainlog=${month}_train.txt
 evallog=${month}_eval.txt
 predictlog=${month}_predict.txt
 
-all: train eval
+all: data train eval
+
+data:
+	uv run src/5-fold.py --outdir ${outdir}
 
 train:
 	uv run src/train.py --outdir ${outdir} --outmodel ${model} > ./log/${trainlog}
@@ -20,5 +23,5 @@ predict:
 clean:
 
 
-.PHONY: all train eval predict
+.PHONY: all train eval predict data
 

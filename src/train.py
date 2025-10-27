@@ -14,17 +14,39 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
 
+
+class LossCallback:
+    """记录并计算训练损失的简单回调（用于兼容旧模型反序列化）。
+
+    - 使用 sklearn.metrics.log_loss 作为显式的 loss_fn
+    - 保存每个 epoch 的损失值到 self.losses
+    """
+
+    def __init__(self, classes: np.ndarray):
+        self.classes = np.asarray(classes)
+        self.losses: list[float] = []
+
+    def compute(self, y_true: np.ndarray, y_proba: np.ndarray) -> float:
+        try:
+            return float(log_loss(y_true, y_proba, labels=self.classes))
+        except Exception:
+            return float("nan")
+
+    def on_epoch_end(self, y_true: np.ndarray, y_proba: np.ndarray) -> float:
+        v = self.compute(y_true, y_proba)
+        self.losses.append(v)
+        return v
+
 def main(args):
     global_start = time.time()
     print("=== 模型训练开始（使用 train.csv / eval.csv）===")
 
-    outdir = args.outdir
-    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(args.outdir, exist_ok=True)
     os.makedirs(args.modelsdir, exist_ok=True)
 
     # 读取 train / eval 数据
-    df_tr = _flex_read_csv(outdir, args.train_file)
-    df_ev = _flex_read_csv(outdir, args.eval_file)
+    df_tr = _flex_read_csv(args.outdir, args.train_file)
+    df_ev = _flex_read_csv(args.outdir, args.eval_file)
     for df_name, df in [("train", df_tr), ("eval", df_ev)]:
         for col in ["case_title", "performed_work", "linked_items"]:
             if col not in df.columns:
@@ -56,7 +78,7 @@ def main(args):
     le = LabelEncoder()
     y_tr = le.fit_transform(y_tr_raw)
 
-    # 过滤 eval 中不在训练标签集的样本（理论上 5-fold.py 会保证都有）
+    # 过滤 eval 中不在训练标签集的样本
     ev_mask = [lbl in set(le.classes_) for lbl in y_ev_raw]
     if not all(ev_mask):
         dropped = int(np.sum(~np.array(ev_mask)))
@@ -68,45 +90,38 @@ def main(args):
 
 
 
-    # 定义模型：字符级 n-gram + SGDClassifier（对大规模稀疏特征更快）
-    pipe = Pipeline([
-        ("tfidf", TfidfVectorizer(
-            # 基于“词”(word)还是“字符”(char/char_wb)来划分 n-gram
-            analyzer=args.tfidf_analyzer,
-            ngram_range=(args.ngram_min, args.ngram_max),
-            max_features=args.tfidf_max_features,
-            min_df=1,
-            sublinear_tf=True, # 对原始词频做子线性缩放，即 tf ← 1 + log(tf)，增强对低频但区分性强的 n-gram 的权重。
-        )),
-        ("clf", SGDClassifier(
-            loss="log_loss",           # 逻辑回归等价的对数损失
-            max_iter=args.max_epochs,
-            tol=1e-4,
-            random_state=42,
-            early_stopping=True,
-            n_iter_no_change=args.patience,
-            learning_rate="optimal",
-            class_weight=("balanced" if args.class_weight_balanced else None),
-            penalty=args.sgd_penalty,
-            alpha=args.sgd_alpha,
-            average=args.sgd_average,
-            n_jobs=-1,
-        ))
-    ])
-
-    tfidf = pipe.named_steps["tfidf"]
-    clf = pipe.named_steps["clf"]
+    # 定义向量化器与分类器（后续用 partial_fit 显式逐 epoch 训练，便于记录 loss 曲线）
+    tfidf = TfidfVectorizer(
+        analyzer=args.tfidf_analyzer,
+        ngram_range=(args.ngram_min, args.ngram_max),
+        max_features=args.tfidf_max_features,
+        min_df=1,
+        sublinear_tf=True,
+    )
+    clf = SGDClassifier(
+        loss="log_loss",
+        # 使用我们自定义的早停逻辑；关闭内置 early_stopping 才能使用 partial_fit
+        early_stopping=False,
+        max_iter=1,
+        tol=None,
+        random_state=42,
+        learning_rate="optimal",
+        class_weight=("balanced" if args.class_weight_balanced else None),
+        penalty=args.sgd_penalty,
+        alpha=args.sgd_alpha,
+        average=args.sgd_average,
+        n_jobs=-1,
+    )
 
     # === 进度条与剩余时间估计 ===
     # 根据是否存在可评估的 eval，和是否开启概率校准，动态确定流程步数
     do_eval = (len(X_ev_text_f) > 0 and len(y_ev) > 0)
     do_calib = (args.calibrate in {"sigmoid", "isotonic"}) and do_eval
     total_steps = 0
-    # 我们跟踪以下阶段：
-    # 1) 向量化训练集  2) 拟合分类器  3) 向量化验证集(可选)  4) 概率校准(可选)
+    # 跟踪流程：1) 向量化训练集 2) 逐 epoch 训练 3) 向量化验证集(可选) 4) 概率校准(可选)
     # 5) 验证评估(可选) 6) 训练 OOD 检测器 7) 保存loss曲线 8) 保存模型 9) 保存评估指标(可选)
     total_steps += 1  # vectorize train
-    total_steps += 1  # fit classifier
+    total_steps += 1  # epoch training (aggregated)
     if do_eval:
         total_steps += 1  # vectorize eval
     if do_calib:
@@ -133,39 +148,110 @@ def main(args):
     X_tr_vec = tfidf.fit_transform(X_tr_text)
     _update_pbar(t0, "vectorize_train")
 
-    # 单次拟合（去掉外层 epoch 循环）
+    # 逐 epoch 训练并记录 loss
     classes = np.arange(len(le.classes_))
-    fit_t0 = time.time()
-    clf.fit(X_tr_vec, y_tr)
-    fit_sec = time.time() - fit_t0
-    # SGDClassifier 没有 max_iter 属性? 实际存在，但为参数；此处稳妥打印拟合耗时
-    print(f"训练完成，耗时 {fmt_sec(fit_sec)}")
-    # 进度更新：分类器拟合
-    try:
-        _update_pbar(fit_t0, "fit_classifier")
-    except Exception:
-        pass
+    loss_cb = LossCallback(classes)
+    losses: list[float] = []
 
-    # 计算训练集损失（仅一次）
-    losses = []
-    try:
-        # SGDClassifier 在 loss='log_loss' 时支持 predict_proba
-        y_proba = clf.predict_proba(X_tr_vec)
-        loss_val = float(log_loss(y_tr, y_proba, labels=classes))
-    except Exception:
-        # 兜底：使用 decision_function 转换为概率（多分类使用 softmax）
+    # 简单的早停逻辑
+    best_loss = float("inf")
+    no_improve = 0
+
+    # 按批量进行增量更新
+    n_samples = X_tr_vec.shape[0]
+    batch_size = max(1, int(args.batch_size))
+    n_batches = (n_samples + batch_size - 1) // batch_size
+
+    fit_t0 = time.time()
+    # 为 epoch 训练添加单独的进度条，展示 loss 与剩余时间
+    epoch_pbar = tqdm(total=int(args.max_epochs), desc="Train epochs", unit="epoch", leave=False)
+    epoch_durations = []
+    rng = np.random.default_rng(42)
+    for epoch in range(int(args.max_epochs)):
+        ep_t0 = time.time()
+        idx = np.arange(n_samples)
+        if args.shuffle:
+            rng.shuffle(idx)
+
+        # 增量学习：首个 partial_fit 需要提供 classes
+        first = True
+        for b in range(n_batches):
+            sl = idx[b * batch_size : (b + 1) * batch_size]
+            X_b = X_tr_vec[sl]
+            y_b = np.asarray(y_tr)[sl]
+            if first:
+                clf.partial_fit(X_b, y_b, classes=classes)
+                first = False
+            else:
+                clf.partial_fit(X_b, y_b)
+
+        # 每个 epoch 结束后在训练集（或其子集）上计算 log loss
+        loss_idx = np.arange(n_samples)
+        loss_sample_size = int(getattr(args, "loss_sample_size", 20000))
+        if loss_sample_size > 0 and n_samples > loss_sample_size:
+            loss_idx = rng.choice(n_samples, size=loss_sample_size, replace=False)
+        X_loss = X_tr_vec[loss_idx]
+        y_loss = np.asarray(y_tr)[loss_idx]
         try:
-            dec = clf.decision_function(X_tr_vec)
+            y_proba = clf.predict_proba(X_loss)
+        except Exception:
+            dec = clf.decision_function(X_loss)
             if dec.ndim == 1:
                 probs_pos = 1 / (1 + np.exp(-dec))
                 y_proba = np.vstack([1 - probs_pos, probs_pos]).T
             else:
                 e = np.exp(dec - np.max(dec, axis=1, keepdims=True))
                 y_proba = e / e.sum(axis=1, keepdims=True)
-            loss_val = float(log_loss(y_tr, y_proba, labels=classes))
+        loss_val = loss_cb.on_epoch_end(np.asarray(y_loss), y_proba)
+        losses.append(loss_val)
+
+        # tqdm 后缀打印 loss 与剩余时间 ETA
+        try:
+            epoch_durations.append(time.time() - ep_t0)
+            rem = max(0, int(args.max_epochs) - (epoch + 1))
+            mean_dt = (sum(epoch_durations) / len(epoch_durations)) if epoch_durations else 0.0
+            eta_sec = mean_dt * rem
+            epoch_pbar.set_postfix_str(f"loss={loss_val:.6f} | ETA~{fmt_sec(eta_sec)}")
+            epoch_pbar.update(1)
         except Exception:
-            loss_val = float("nan")
-    losses.append(loss_val)
+            pass
+
+        # 打印并写入训练日志
+        log_dir = os.path.join(os.getcwd(), "log")
+        os.makedirs(log_dir, exist_ok=True)
+        # 日志文件名与 outmodel 对齐，如 9.joblib -> 9_train.txt
+        stem = os.path.splitext(os.path.basename(args.outmodel))[0]
+        train_log_path = os.path.join(log_dir, f"{stem}_train.txt")
+        msg = f"epoch={epoch+1}/{args.max_epochs} loss={loss_val:.6f}"
+        print(msg)
+        try:
+            with open(train_log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+        # 早停
+        if loss_val < best_loss - 1e-8:
+            best_loss = loss_val
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= int(args.patience):
+                print(f"Early stopping at epoch {epoch+1} (best_loss={best_loss:.6f})")
+                break
+
+    fit_sec = time.time() - fit_t0
+    # 关闭 epoch 进度条
+    try:
+        epoch_pbar.close()
+    except Exception:
+        pass
+
+    print(f"训练完成，耗时 {fmt_sec(fit_sec)}")
+    try:
+        _update_pbar(fit_t0, "fit_epochs")
+    except Exception:
+        pass
 
     # 评估（eval 集）
     X_ev_vec = None
@@ -182,12 +268,13 @@ def main(args):
         calibrator = None
         if args.calibrate in {"sigmoid", "isotonic"}:
             try:
+                # 由于我们上面使用了 partial_fit，这里进行基于 eval 的一次性校准
                 calibrator = CalibratedClassifierCV(base_estimator=clf, method=args.calibrate, cv="prefit")
                 calibrate_t0 = time.time()
                 calibrator.fit(X_ev_vec, y_ev)
                 print(f"已使用 {args.calibrate} 概率校准（耗时 {fmt_sec(time.time() - calibrate_t0)}）")
-                # 替换管道中的分类器为校准后的版本
-                pipe.named_steps["clf"] = calibrator
+                # 替换分类器为校准后的版本
+                clf = calibrator
                 try:
                     _update_pbar(calibrate_t0, "calibration")
                 except Exception:
@@ -196,7 +283,7 @@ def main(args):
                 print(f"[警告] 概率校准失败，将继续使用未校准模型。原因：{e}")
 
         # 使用（可能校准的）分类器进行评估
-        clf_for_eval = pipe.named_steps["clf"]
+        clf_for_eval = clf
         t0 = time.time()
         y_pred = clf_for_eval.predict(X_ev_vec)
         acc = accuracy_score(y_ev, y_pred)
@@ -239,7 +326,7 @@ def main(args):
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
 
-    clf_final = pipe.named_steps["clf"]  # 可能已被校准替换
+    clf_final = clf  # 可能已被校准替换
 
     # 1) 在 eval 上计算 p_max（若 eval 为空则跳过）
     y_ooc = None
@@ -307,10 +394,10 @@ def main(args):
     plt.title('Training Loss Curve')
     plt.legend()
     plt.grid(True)
-    loss_plot_path = os.path.join(outdir, "loss_curve.png")
+    loss_plot_path = os.path.join(args.outdir, "loss_curve.png")
     plt.savefig(loss_plot_path)
     plt.close()
-    with open(os.path.join(outdir, "loss_data.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.outdir, "loss_data.json"), "w", encoding="utf-8") as f:
         json.dump({"losses": losses}, f, ensure_ascii=False, indent=2)
     try:
         _update_pbar(loss_t0, "save_loss")
@@ -320,6 +407,8 @@ def main(args):
     # 保存模型
     # 保存模型及未知标签检测器
     model_t0 = time.time()
+    # 重新装配 pipeline 以便预测阶段统一使用
+    pipe = Pipeline([("tfidf", tfidf), ("clf", clf)])
     model_bundle = {"model": pipe, "label_encoder": le, "ooc_detector": ooc_detector}
     model_path = os.path.join(args.modelsdir, args.outmodel)
     joblib.dump(model_bundle, model_path)
@@ -332,7 +421,7 @@ def main(args):
     # 保存评估指标
     if eval_metrics:
         metrics_t0 = time.time()
-        metrics_path = os.path.join(outdir, "metrics_eval.csv")
+        metrics_path = os.path.join(args.outdir, "metrics_eval.csv")
         pd.DataFrame([eval_metrics]).to_csv(metrics_path, index=False)
         print(f"评估指标已保存到: {metrics_path}")
         try:
@@ -355,7 +444,10 @@ if __name__ == "__main__":
     parser.add_argument("--modelsdir", type=str, default="./models", help="模型保存目录")
     parser.add_argument("--outmodel", type=str, default="9.joblib", help="模型保存文件名")
     parser.add_argument("--max-epochs", type=int, default=100, help="最大迭代轮次")
-    parser.add_argument("--patience", type=int, default=5, help="早停耐心值")
+    parser.add_argument("--patience", type=int, default=5, help="早停耐心值（若连续 N 个 epoch 未提升则停止）")
+    parser.add_argument("--batch-size", type=int, default=1024, help="增量训练的 batch 大小")
+    parser.add_argument("--shuffle", action="store_true", help="每个 epoch 打乱样本")
+    parser.add_argument("--loss-sample-size", type=int, default=20000, help="每个epoch用于计算loss的样本数（0或负数表示使用全量）")
     # 可调向量化/优化参数
     parser.add_argument("--tfidf-analyzer", type=str, default="char", choices=["char", "char_wb"], help="TF-IDF 分析粒度")
     parser.add_argument("--ngram-min", type=int, default=2, help="ngram 最小长度")
