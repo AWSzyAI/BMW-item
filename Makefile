@@ -1,4 +1,4 @@
-month=9
+month=2
 outdir=./output/2025_up_to_month_${month}
 model=${month}.joblib
 trainlog=${month}_train.txt

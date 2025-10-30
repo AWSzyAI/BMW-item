@@ -14,6 +14,13 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
 
+# 可选依赖：imbalanced-learn（用于 SMOTE / SMOTEENN / SMOTETomek）
+try:
+    from imblearn.over_sampling import SMOTE, SMOTEENN, SMOTETomek, RandomOverSampler
+    _HAS_IMBLEARN = True
+except Exception:
+    SMOTE = SMOTEENN = SMOTETomek = RandomOverSampler = None
+    _HAS_IMBLEARN = False
 
 def _read_split_or_combined(base_dir: str, base_filename: str) -> pd.DataFrame:
     """读取数据集，优先支持 X/Y 分离文件，其次回退到单表 CSV。
@@ -146,7 +153,8 @@ def main(args):
     tfidf = TfidfVectorizer(
         analyzer=args.tfidf_analyzer,
         ngram_range=(args.ngram_min, args.ngram_max),
-        max_features=args.tfidf_max_features,
+        max_features=args.tfidf_max_features, 
+        # todo： 训练后打印tfidf的实际features数量
         min_df=1,
         sublinear_tf=True,
     )
@@ -199,6 +207,66 @@ def main(args):
     t0 = time.time()
     X_tr_vec = tfidf.fit_transform(X_tr_text)
     _update_pbar(t0, "vectorize_train")
+
+    # --- start resampling block (paste right after vectorize_train update) ---
+    resample_method = getattr(args, "resample_method", "none")
+    if resample_method != "none":
+        print(f"[Info] 启用不平衡采样：{resample_method}")
+
+        # 选择采样器（SMOTE/SMOTEENN/SMOTETomek/RandomOverSampler）
+        if resample_method == "smote":
+            sampler = SMOTE(random_state=42)
+            requires_dense = True
+        elif resample_method == "smoteenn":
+            sampler = SMOTEENN(random_state=42)
+            requires_dense = True
+        elif resample_method == "smotetomek":
+            sampler = SMOTETomek(random_state=42)
+            requires_dense = True
+        elif resample_method == "ros":
+            sampler = RandomOverSampler(random_state=42)
+            requires_dense = False
+        else:
+            sampler = None
+            requires_dense = False
+
+        # 如果需要稠密矩阵，先检查是否可能 OOM（粗略估算）
+        n_samples, n_features = X_tr_vec.shape
+        dense_elements = int(n_samples) * int(n_features)
+        # 阈值：元素数超过 50e6 则认为太大（50M floats ~ 400MB，具体视内存而定）
+        DENSE_THRESHOLD = 50_000_000
+
+        if requires_dense and dense_elements > DENSE_THRESHOLD:
+            # 回退到简单过采样（ROS），避免稠密化导致 OOM
+            print(
+                f"[Warning] 原始特征稀疏矩阵大小 = {n_samples}x{n_features}，"
+                f"稠密化会占用大量内存（元素={dense_elements}）。自动回退到 RandomOverSampler（ros）。"
+            )
+            sampler = RandomOverSampler(random_state=42)
+            requires_dense = False
+
+        # 执行采样：注意 imblearn 接受稠密或稀疏（随机过采样可接收稀疏），但 SMOTE 需要稠密
+        if requires_dense:
+            X_tr_arr = X_tr_vec.toarray()
+            X_res, y_res = sampler.fit_resample(X_tr_arr, y_tr)
+            # X_res 是 numpy.ndarray（稠密），后续训练支持稠密
+            X_tr_vec = X_res
+            y_tr = y_res
+        else:
+            # 对于支持稀疏输入的采样器（如 RandomOverSampler），直接传递稀疏矩阵
+            try:
+                X_res, y_res = sampler.fit_resample(X_tr_vec, y_tr)
+                X_tr_vec = X_res
+                y_tr = y_res
+            except Exception:
+                # 最后回退：把稀疏矩阵转为稠密再试
+                X_tr_arr = X_tr_vec.toarray()
+                X_res, y_res = RandomOverSampler(random_state=42).fit_resample(X_tr_arr, y_tr)
+                X_tr_vec = X_res
+                y_tr = y_res
+
+        print(f"[Info] 采样后训练集样本数: {getattr(X_tr_vec, 'shape', (len(X_tr_vec),))[0]}")
+    # --- end resampling block ---
 
     # 逐 epoch 训练并记录 loss
     classes = np.arange(len(le.classes_))
@@ -495,16 +563,18 @@ if __name__ == "__main__":
     parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_2", help="输出目录（读取数据与保存训练曲线/指标）")
     parser.add_argument("--modelsdir", type=str, default="./models", help="模型保存目录")
     parser.add_argument("--outmodel", type=str, default="9.joblib", help="模型保存文件名")
+
+
     parser.add_argument("--max-epochs", type=int, default=1000, help="最大迭代轮次")
     parser.add_argument("--patience", type=int, default=5, help="早停耐心值（若连续 N 个 epoch 未提升则停止）")
     parser.add_argument("--batch-size", type=int, default=1024, help="增量训练的 batch 大小")
     parser.add_argument("--shuffle", action="store_true", help="每个 epoch 打乱样本")
-    parser.add_argument("--loss-sample-size", type=int, default=20000, help="每个epoch用于计算loss的样本数（0或负数表示使用全量）")
+    parser.add_argument("--loss-sample-size", type=int, default=20000, help="每个epoch用于计算loss的样本数（0或负数表示使用全量）") #？20000太多了吧
     # 可调向量化/优化参数
     parser.add_argument("--tfidf-analyzer", type=str, default="char", choices=["char", "char_wb"], help="TF-IDF 分析粒度")
     parser.add_argument("--ngram-min", type=int, default=2, help="ngram 最小长度")
     parser.add_argument("--ngram-max", type=int, default=5, help="ngram 最大长度")
-    parser.add_argument("--tfidf-max-features", type=int, default=100_000, help="TF-IDF 最大特征数（可调大以提升效果）")
+    parser.add_argument("--tfidf-max-features", type=int, default=100_000, help="TF-IDF 最大特征数")
     parser.add_argument("--sgd-penalty", type=str, default="l2", choices=["l2", "l1", "elasticnet"], help="SGD 正则项")
     parser.add_argument("--sgd-alpha", type=float, default=0.0001, help="SGD 正则强度 alpha")
     parser.add_argument("--sgd-average", action="store_true", help="启用参数平均（有助于泛化）")
@@ -513,5 +583,12 @@ if __name__ == "__main__":
     # OOC/MSP 阈值回退参数
     parser.add_argument("--ooc-tau-percentile", type=float, default=5.0, help="无 OOD 正样本时，p_max 的分位数阈值（百分位）")
     parser.add_argument("--ooc-temperature", type=float, default=20.0, help="将 (tau - p_max) 经 sigmoid 映射为概率的温度系数")
+    parser.add_argument(
+        "--resample-method",
+        type=str,
+        default="none",
+        choices=["none", "ros", "smote", "smoteenn", "smotetomek"],
+        help="不平衡处理方法：none/ros/smote/smoteenn/smotetomek",
+    )
     args = parser.parse_args()
     main(args)

@@ -29,3 +29,74 @@ fix item_title eval
 1-9>>>10  0.457876 | 0.366022    | 0.048724 | 0.457876 | 0.576433 | 0.616728 | 0.675036 | 0.7256
 
 ```
+
+
+```
+# 示例：以月9的数据目录为例（替换为你要评测的 outdir）
+DATA_OUTDIR=./output/2025_up_to_month_9
+
+# 小空间并行搜索（并行 32 进程，可根据 CPU/内存上调/下调）
+python src/tfidf_tune.py \
+  --data-outdir "$DATA_OUTDIR" \
+  --exp-root ./output/tfidf_tune \
+  --modelsdir ./models \
+  --max-epochs 60 \
+  --resample-method ros \
+  --calibrate none \
+  --n-jobs 32 \
+  --analyzers char char_wb \
+  --ngram-mins 2 3 \
+  --ngram-maxs 4 5 \
+  --max-features 20000 50000 100000 \
+  --sgd-alphas 0.0001 0.00005 0.00001 \
+  --sgd-penalties l2 elasticnet \
+  --shuffle
+```
+
+
+```
+baseline：--resample-method none
+ros：--resample-method ros
+smote：--resample-method smote
+smoteenn：--resample-method smoteenn
+smotetomek：--resample-method smotetomek
+uv run src/train.py 
+
+
+OUT_ROOT=./output/experiments  # 所有实验的父目录，会按实验名创建子目录
+MODELS_DIR=./models
+mkdir -p $OUT_ROOT
+mkdir -p $MODELS_DIR
+
+EXP=baseline_f100k_none
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/0) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 100000 --resample-method none
+
+EXP=ros_f100k
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/1) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 100000 --resample-method ros
+
+EXP=smote_f100k
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/2) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 100000 --resample-method smote
+
+EXP=smoteenn_f20k
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/3) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 20000 --resample-method smoteenn
+
+EXP=smotetomek_f20k
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/4) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 20000 --resample-method smotetomek
+
+EXP=smote_f10k
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/5) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 10000 --resample-method smote
+
+EXP=baseline_f10k
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/6) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 50 --tfidf-max-features 10000 --resample-method none
+
+EXP=ros_f10k_long
+mkdir -p $OUT_ROOT/$EXP
+python [train.py](http://_vscodecontentref_/7) --outdir $OUT_ROOT/$EXP --modelsdir $MODELS_DIR --outmodel ${EXP}.joblib --max-epochs 150 --tfidf-max-features 10000 --resample-method ros
+```
