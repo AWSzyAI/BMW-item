@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os, json, argparse, warnings, time
 import numpy as np
 import pandas as pd
@@ -14,13 +17,25 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
 
-# 可选依赖：imbalanced-learn（用于 SMOTE / SMOTEENN / SMOTETomek）
+# ========== 可选依赖：imbalanced-learn ==========
+# 正确的导入位置：SMOTE 在 over_sampling；SMOTEENN/SMOTETomek 在 combine
 try:
-    from imblearn.over_sampling import SMOTE, SMOTEENN, SMOTETomek, RandomOverSampler
+    from imblearn.over_sampling import SMOTE, RandomOverSampler
+    from imblearn.combine import SMOTEENN, SMOTETomek
     _HAS_IMBLEARN = True
 except Exception:
     SMOTE = SMOTEENN = SMOTETomek = RandomOverSampler = None
     _HAS_IMBLEARN = False
+
+# 稀疏检测可选（无则降级处理）
+try:
+    from scipy.sparse import issparse, vstack as sp_vstack  # noqa: F401
+except Exception:
+    issparse = lambda m: False  # type: ignore
+    sp_vstack = None  # type: ignore
+
+from collections import Counter
+
 
 def _read_split_or_combined(base_dir: str, base_filename: str) -> pd.DataFrame:
     """读取数据集，优先支持 X/Y 分离文件，其次回退到单表 CSV。
@@ -32,7 +47,7 @@ def _read_split_or_combined(base_dir: str, base_filename: str) -> pd.DataFrame:
     返回值为合并后的 DataFrame（X 列 + linked_items 列）。
     """
     # 绝对路径优先，其次 base_dir 拼接
-    def _cand(p: str) -> str | None:
+    def _cand(p: str):
         return p if (p and os.path.isabs(p) and os.path.exists(p)) else None
 
     # 计算 stem（去掉 .csv 和可能的 _X/_y 后缀）
@@ -96,6 +111,7 @@ class LossCallback:
         self.losses.append(v)
         return v
 
+
 def main(args):
     global_start = time.time()
     print("=== 模型训练开始（使用 train.csv / eval.csv）===")
@@ -119,19 +135,18 @@ def main(args):
     y_tr_raw = df_tr["linked_items"].astype(str).tolist()
     X_ev_text = build_text(df_ev).tolist()
     y_ev_raw = df_ev["linked_items"].astype(str).tolist()
-    
-    # 如果某一标签下只有一个样本，那就把这个样本复制一份
+
+    # 如果某一标签下只有一个样本，那就把这个样本复制一份（极端少样本的兜底）
     vc = df_tr["linked_items"].value_counts()
     rare_labels = vc[vc == 1].index.tolist()
     if rare_labels:
         rare_samples = df_tr[df_tr["linked_items"].isin(rare_labels)]
         df_tr = pd.concat([df_tr, rare_samples], ignore_index=True)
         print(f"已复制 {len(rare_samples)} 个单样本类别，以平衡训练集。")
-    
+
     # 更新文本与标签（复制后）
     X_tr_text = build_text(df_tr).tolist()
     y_tr_raw = df_tr["linked_items"].astype(str).tolist()
-
 
     # 标签编码（仅基于训练集）
     le = LabelEncoder()
@@ -145,22 +160,17 @@ def main(args):
     X_ev_text_f = [t for t, m in zip(X_ev_text, ev_mask) if m]
     y_ev_raw_f = [l for l, m in zip(y_ev_raw, ev_mask) if m]
     y_ev = le.transform(y_ev_raw_f) if len(y_ev_raw_f) > 0 else np.array([])
-    # todo: 被过滤掉的not-in-train的样本没被处理
 
-
-
-    # 定义向量化器与分类器（后续用 partial_fit 显式逐 epoch 训练，便于记录 loss 曲线）
+    # 向量化器与分类器（后续用 partial_fit 显式逐 epoch 训练，便于记录 loss 曲线）
     tfidf = TfidfVectorizer(
         analyzer=args.tfidf_analyzer,
         ngram_range=(args.ngram_min, args.ngram_max),
-        max_features=args.tfidf_max_features, 
-        # todo： 训练后打印tfidf的实际features数量
+        max_features=args.tfidf_max_features,
         min_df=1,
         sublinear_tf=True,
     )
     clf = SGDClassifier(
         loss="log_loss",
-        # 使用我们自定义的早停逻辑；关闭内置 early_stopping 才能使用 partial_fit
         early_stopping=False,
         max_iter=1,
         tol=None,
@@ -174,12 +184,9 @@ def main(args):
     )
 
     # === 进度条与剩余时间估计 ===
-    # 根据是否存在可评估的 eval，和是否开启概率校准，动态确定流程步数
     do_eval = (len(X_ev_text_f) > 0 and len(y_ev) > 0)
     do_calib = (args.calibrate in {"sigmoid", "isotonic"}) and do_eval
     total_steps = 0
-    # 跟踪流程：1) 向量化训练集 2) 逐 epoch 训练 3) 向量化验证集(可选) 4) 概率校准(可选)
-    # 5) 验证评估(可选) 6) 训练 OOD 检测器 7) 保存loss曲线 8) 保存模型 9) 保存评估指标(可选)
     total_steps += 1  # vectorize train
     total_steps += 1  # epoch training (aggregated)
     if do_eval:
@@ -195,6 +202,7 @@ def main(args):
 
     pbar = tqdm(total=total_steps, desc="Train pipeline", unit="step")
     step_durations = []
+
     def _update_pbar(t0, label):
         dt = time.time() - t0
         step_durations.append(dt)
@@ -204,69 +212,94 @@ def main(args):
         pbar.set_postfix_str(f"{label}={fmt_sec(dt)} | ETA~{fmt_sec(eta_sec)}")
         pbar.update(1)
 
+    # 向量化训练集
     t0 = time.time()
     X_tr_vec = tfidf.fit_transform(X_tr_text)
     _update_pbar(t0, "vectorize_train")
 
-    # --- start resampling block (paste right after vectorize_train update) ---
+    # ========== 类别不平衡处理（修正版，含无依赖回退） ==========
     resample_method = getattr(args, "resample_method", "none")
     if resample_method != "none":
         print(f"[Info] 启用不平衡采样：{resample_method}")
 
-        # 选择采样器（SMOTE/SMOTEENN/SMOTETomek/RandomOverSampler）
+        # 简易随机过采样（无依赖回退），支持稀疏/稠密
+        def _simple_ros_sparse_or_dense(X, y):
+            y = np.asarray(y)
+            classes, counts = np.unique(y, return_counts=True)
+            max_n = counts.max()
+            idx_all = []
+            rng = np.random.default_rng(42)
+            for c in classes:
+                idx_c = np.where(y == c)[0]
+                if len(idx_c) == 0:
+                    continue
+                if len(idx_c) < max_n:
+                    extra = rng.choice(idx_c, size=max_n - len(idx_c), replace=True)
+                    idx_c = np.concatenate([idx_c, extra], axis=0)
+                idx_all.append(idx_c)
+            sel = np.concatenate(idx_all, axis=0)
+            if issparse(X):
+                return X[sel], y[sel]
+            else:
+                return X[sel], y[sel]
+
+        requires_dense = False
+        sampler = None
+
         if resample_method == "smote":
-            sampler = SMOTE(random_state=42)
-            requires_dense = True
-        elif resample_method == "smoteenn":
-            sampler = SMOTEENN(random_state=42)
-            requires_dense = True
-        elif resample_method == "smotetomek":
-            sampler = SMOTETomek(random_state=42)
-            requires_dense = True
-        elif resample_method == "ros":
-            sampler = RandomOverSampler(random_state=42)
-            requires_dense = False
+            if _HAS_IMBLEARN and SMOTE is not None:
+                sampler = SMOTE(random_state=42)
+                requires_dense = True
+            else:
+                print("[Warning] 未安装 imbalanced-learn 或导入失败，SMOTE 回退为随机过采样（简易实现）。")
+                resample_method = "ros"
+
+        if resample_method == "smoteenn":
+            if _HAS_IMBLEARN and SMOTEENN is not None:
+                sampler = SMOTEENN(random_state=42)
+                requires_dense = True
+            else:
+                print("[Warning] 未安装 imbalanced-learn 或导入失败，SMOTEENN 回退为随机过采样（简易实现）。")
+                resample_method = "ros"
+
+        if resample_method == "smotetomek":
+            if _HAS_IMBLEARN and SMOTETomek is not None:
+                sampler = SMOTETomek(random_state=42)
+                requires_dense = True
+            else:
+                print("[Warning] 未安装 imbalanced-learn 或导入失败，SMOTETomek 回退为随机过采样（简易实现）。")
+                resample_method = "ros"
+
+        if resample_method == "ros":
+            if _HAS_IMBLEARN and RandomOverSampler is not None:
+                sampler = RandomOverSampler(random_state=42)
+                requires_dense = False
+            else:
+                sampler = None  # 使用简易 ROS
+
+        # 执行采样（避免超大矩阵稠密化导致 OOM）
+        if sampler is not None:
+            if requires_dense:
+                n_samples, n_features = X_tr_vec.shape
+                DENSE_THRESHOLD = 50_000_000  # 50M 元素保守阈值
+                if n_samples * n_features > DENSE_THRESHOLD:
+                    print("[Warning] 稠密化内存开销过大，回退为简易随机过采样。")
+                    X_tr_vec, y_tr = _simple_ros_sparse_or_dense(X_tr_vec, y_tr)
+                else:
+                    X_tr_vec = X_tr_vec.toarray()
+                    X_tr_vec, y_tr = sampler.fit_resample(X_tr_vec, y_tr)
+            else:
+                try:
+                    X_tr_vec, y_tr = sampler.fit_resample(X_tr_vec, y_tr)
+                except Exception:
+                    print("[Warning] 采样器不支持稀疏输入，回退为简易随机过采样。")
+                    X_tr_vec, y_tr = _simple_ros_sparse_or_dense(X_tr_vec, y_tr)
         else:
-            sampler = None
-            requires_dense = False
+            X_tr_vec, y_tr = _simple_ros_sparse_or_dense(X_tr_vec, y_tr)
 
-        # 如果需要稠密矩阵，先检查是否可能 OOM（粗略估算）
-        n_samples, n_features = X_tr_vec.shape
-        dense_elements = int(n_samples) * int(n_features)
-        # 阈值：元素数超过 50e6 则认为太大（50M floats ~ 400MB，具体视内存而定）
-        DENSE_THRESHOLD = 50_000_000
-
-        if requires_dense and dense_elements > DENSE_THRESHOLD:
-            # 回退到简单过采样（ROS），避免稠密化导致 OOM
-            print(
-                f"[Warning] 原始特征稀疏矩阵大小 = {n_samples}x{n_features}，"
-                f"稠密化会占用大量内存（元素={dense_elements}）。自动回退到 RandomOverSampler（ros）。"
-            )
-            sampler = RandomOverSampler(random_state=42)
-            requires_dense = False
-
-        # 执行采样：注意 imblearn 接受稠密或稀疏（随机过采样可接收稀疏），但 SMOTE 需要稠密
-        if requires_dense:
-            X_tr_arr = X_tr_vec.toarray()
-            X_res, y_res = sampler.fit_resample(X_tr_arr, y_tr)
-            # X_res 是 numpy.ndarray（稠密），后续训练支持稠密
-            X_tr_vec = X_res
-            y_tr = y_res
-        else:
-            # 对于支持稀疏输入的采样器（如 RandomOverSampler），直接传递稀疏矩阵
-            try:
-                X_res, y_res = sampler.fit_resample(X_tr_vec, y_tr)
-                X_tr_vec = X_res
-                y_tr = y_res
-            except Exception:
-                # 最后回退：把稀疏矩阵转为稠密再试
-                X_tr_arr = X_tr_vec.toarray()
-                X_res, y_res = RandomOverSampler(random_state=42).fit_resample(X_tr_arr, y_tr)
-                X_tr_vec = X_res
-                y_tr = y_res
-
-        print(f"[Info] 采样后训练集样本数: {getattr(X_tr_vec, 'shape', (len(X_tr_vec),))[0]}")
-    # --- end resampling block ---
+        n_after = X_tr_vec.shape[0]  # 稀疏/稠密/ndarray 都有 shape
+        print(f"[Info] 采样后训练集样本数: {n_after} | label分布: {Counter(y_tr)}")
+    # ========== 不平衡处理结束 ==========
 
     # 逐 epoch 训练并记录 loss
     classes = np.arange(len(le.classes_))
@@ -283,10 +316,10 @@ def main(args):
     n_batches = (n_samples + batch_size - 1) // batch_size
 
     fit_t0 = time.time()
-    # 为 epoch 训练添加单独的进度条，展示 loss 与剩余时间
     epoch_pbar = tqdm(total=int(args.max_epochs), desc="Train epochs", unit="epoch", leave=False)
     epoch_durations = []
     rng = np.random.default_rng(42)
+
     for epoch in range(int(args.max_epochs)):
         ep_t0 = time.time()
         idx = np.arange(n_samples)
@@ -339,7 +372,6 @@ def main(args):
         # 打印并写入训练日志
         log_dir = os.path.join(os.getcwd(), "log")
         os.makedirs(log_dir, exist_ok=True)
-        # 日志文件名与 outmodel 对齐，如 9.joblib -> 9_train.txt
         stem = os.path.splitext(os.path.basename(args.outmodel))[0]
         train_log_path = os.path.join(log_dir, f"{stem}_train.txt")
         msg = f"epoch={epoch+1}/{args.max_epochs} loss={loss_val:.6f}"
@@ -361,7 +393,6 @@ def main(args):
                 break
 
     fit_sec = time.time() - fit_t0
-    # 关闭 epoch 进度条
     try:
         epoch_pbar.close()
     except Exception:
@@ -384,16 +415,14 @@ def main(args):
             pass
     eval_metrics = {}
     if X_ev_vec is not None and len(y_ev) > 0:
-        # 可选：概率校准（提升阈值型/开放集判别的可靠性）
+        # 概率校准（可选）
         calibrator = None
         if args.calibrate in {"sigmoid", "isotonic"}:
             try:
-                # 由于我们上面使用了 partial_fit，这里进行基于 eval 的一次性校准
                 calibrator = CalibratedClassifierCV(base_estimator=clf, method=args.calibrate, cv="prefit")
                 calibrate_t0 = time.time()
                 calibrator.fit(X_ev_vec, y_ev)
                 print(f"已使用 {args.calibrate} 概率校准（耗时 {fmt_sec(time.time() - calibrate_t0)}）")
-                # 替换分类器为校准后的版本
                 clf = calibrator
                 try:
                     _update_pbar(calibrate_t0, "calibration")
@@ -402,13 +431,13 @@ def main(args):
             except Exception as e:
                 print(f"[警告] 概率校准失败，将继续使用未校准模型。原因：{e}")
 
-        # 使用（可能校准的）分类器进行评估
         clf_for_eval = clf
         t0 = time.time()
         y_pred = clf_for_eval.predict(X_ev_vec)
         acc = accuracy_score(y_ev, y_pred)
         f1w = f1_score(y_ev, y_pred, average="weighted")
         f1m = f1_score(y_ev, y_pred, average="macro")
+
         # 计算概率用于 hit@k
         y_proba_ev = None
         try:
@@ -442,13 +471,13 @@ def main(args):
     else:
         print("[提示] eval 集为空或无可评估样本，跳过评估。")
 
-    # 训练未知标签（not-in-train）检测器（MSP：最大软概率阈值法，若有正样本则可用LogReg）
+    # 训练未知标签（not-in-train）检测器（MSP/LogReg）
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
 
     clf_final = clf  # 可能已被校准替换
 
-    # 1) 在 eval 上计算 p_max（若 eval 为空则跳过）
+    # 1) 在 eval 全量上计算 p_max（若 eval 为空则跳过）
     y_ooc = None
     p_max_ev_all = None
     if len(X_ev_text) > 0:
@@ -524,10 +553,8 @@ def main(args):
     except Exception:
         pass
 
-    # 保存模型
-    # 保存模型及未知标签检测器
+    # 保存模型（统一推理接口）
     model_t0 = time.time()
-    # 重新装配 pipeline 以便预测阶段统一使用
     pipe = Pipeline([("tfidf", tfidf), ("clf", clf)])
     model_bundle = {"model": pipe, "label_encoder": le, "ooc_detector": ooc_detector}
     model_path = os.path.join(args.modelsdir, args.outmodel)
@@ -556,6 +583,7 @@ def main(args):
     except Exception:
         pass
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-file", type=str, default="train.csv", help="训练集文件名（默认从 outdir 读取）")
@@ -564,12 +592,12 @@ if __name__ == "__main__":
     parser.add_argument("--modelsdir", type=str, default="./models", help="模型保存目录")
     parser.add_argument("--outmodel", type=str, default="9.joblib", help="模型保存文件名")
 
-
     parser.add_argument("--max-epochs", type=int, default=1000, help="最大迭代轮次")
     parser.add_argument("--patience", type=int, default=5, help="早停耐心值（若连续 N 个 epoch 未提升则停止）")
     parser.add_argument("--batch-size", type=int, default=1024, help="增量训练的 batch 大小")
     parser.add_argument("--shuffle", action="store_true", help="每个 epoch 打乱样本")
-    parser.add_argument("--loss-sample-size", type=int, default=20000, help="每个epoch用于计算loss的样本数（0或负数表示使用全量）") #？20000太多了吧
+    parser.add_argument("--loss-sample-size", type=int, default=20000, help="每个epoch用于计算loss的样本数（0或负数表示使用全量）")
+
     # 可调向量化/优化参数
     parser.add_argument("--tfidf-analyzer", type=str, default="char", choices=["char", "char_wb"], help="TF-IDF 分析粒度")
     parser.add_argument("--ngram-min", type=int, default=2, help="ngram 最小长度")
@@ -580,9 +608,11 @@ if __name__ == "__main__":
     parser.add_argument("--sgd-average", action="store_true", help="启用参数平均（有助于泛化）")
     parser.add_argument("--class-weight-balanced", action="store_true", help="启用类别平衡权重")
     parser.add_argument("--calibrate", type=str, default="none", choices=["none", "sigmoid", "isotonic"], help="概率校准方式（基于 eval 进行预拟合）")
+
     # OOC/MSP 阈值回退参数
     parser.add_argument("--ooc-tau-percentile", type=float, default=5.0, help="无 OOD 正样本时，p_max 的分位数阈值（百分位）")
     parser.add_argument("--ooc-temperature", type=float, default=20.0, help="将 (tau - p_max) 经 sigmoid 映射为概率的温度系数")
+
     parser.add_argument(
         "--resample-method",
         type=str,

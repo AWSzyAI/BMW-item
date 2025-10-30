@@ -11,7 +11,23 @@ data:
 	uv run src/5-fold.py --outdir ${outdir}
 
 train:
-	uv run src/train.py --outdir ${outdir} --outmodel ${model} > ./log/${trainlog}
+	uv run src/train.py \
+		--outdir ./output/tfidf_tune/achar_wb_n2-4_f100000_alpha0.0001_penl2_ros \
+		--modelsdir ./models \
+		--outmodel achar_wb_n2-4_f100000_alpha0.0001_penl2_ros.joblib \
+		--max-epochs 60 \
+		--tfidf-analyzer char_wb \
+		--ngram-min 2 \
+		--ngram-max 4 \
+		--tfidf-max-features 100000 \
+		--sgd-alpha 0.0001 \
+		--sgd-penalty l2 \
+		--resample-method ros \
+		--train-file train.csv \
+		--eval-file eval.csv \
+		--calibrate none \
+		--class-weight-balanced \
+		--shuffle
 
 eval:
 	uv run src/eval.py  --model ${model} --outdir ${outdir} > ./log/${evallog}

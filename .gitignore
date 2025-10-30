@@ -10,3 +10,4 @@ settings.json
 .vscode/
 .python-version
 /models/
+.python-version

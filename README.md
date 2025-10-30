@@ -31,9 +31,30 @@ fix item_title eval
 ```
 
 
+uv pip install -r requirements.txt --index-url https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple
+
 ```
 # 示例：以月9的数据目录为例（替换为你要评测的 outdir）
-DATA_OUTDIR=./output/2025_up_to_month_9
+export DATA_OUTDIR=./output/2025_up_to_month_2
+
+# 小空间并行搜索（并行 32 进程，可根据 CPU/内存上调/下调）
+uv run src/tfidf_tune.py \
+  --data-outdir "$DATA_OUTDIR" \
+  --exp-root ./output/tfidf_tune \
+  --modelsdir ./models \
+  --max-epochs 60 \
+  --resample-method ros \
+  --calibrate none \
+  --n-jobs 32 \
+  --analyzers char char_wb \
+  --ngram-mins 2 3 \
+  --ngram-maxs 4 5 \
+  --max-features 20000 50000 100000 \
+  --sgd-alphas 0.0001 0.00005 0.00001 \
+  --sgd-penalties l2 elasticnet \
+  --shuffle
+
+export DATA_OUTDIR=./output/2025_up_to_month_2
 
 # 小空间并行搜索（并行 32 进程，可根据 CPU/内存上调/下调）
 python src/tfidf_tune.py \
@@ -51,6 +72,51 @@ python src/tfidf_tune.py \
   --sgd-alphas 0.0001 0.00005 0.00001 \
   --sgd-penalties l2 elasticnet \
   --shuffle
+
+
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+python src/tfidf_tune.py \
+  --data-outdir "$DATA_OUTDIR" \
+  --exp-root ./output/tfidf_tune \
+  --modelsdir ./models \
+  --max-epochs 60 \
+  --resample-method ros \
+  --calibrate none \
+  --n-jobs 8 \
+  --analyzers char char_wb \
+  --ngram-mins 2 3 \
+  --ngram-maxs 4 5 \
+  --max-features 20000 50000 100000 \
+  --sgd-alphas 0.0001 0.00005 0.00001 \
+  --sgd-penalties l2 elasticnet \
+  --shuffle
+
+
+
+set -x DATA_OUTDIR (pwd)/output/2025_up_to_month_2
+ls $DATA_OUTDIR/train_X.csv $DATA_OUTDIR/train_y.csv $DATA_OUTDIR/eval_X.csv $DATA_OUTDIR/eval_y.csv
+
+set -x OMP_NUM_THREADS 1
+set -x MKL_NUM_THREADS 1
+set -x OPENBLAS_NUM_THREADS 1
+
+python src/tfidf_tune.py \
+  --data-outdir $DATA_OUTDIR \
+  --exp-root ./output/tfidf_tune \
+  --modelsdir ./models \
+  --max-epochs 60 \
+  --resample-method ros \
+  --calibrate none \
+  --n-jobs 8 \
+  --analyzers char char_wb \
+  --ngram-mins 2 3 \
+  --ngram-maxs 4 5 \
+  --max-features 20000 50000 100000 \
+  --sgd-alphas 0.0001 0.00005 0.00001 \
+  --sgd-penalties l2 elasticnet \
+  --shuffle
+
+
 ```
 
 
