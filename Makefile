@@ -1,4 +1,4 @@
-month=2
+month=7
 outdir=./output/2025_up_to_month_${month}
 model=${month}.joblib
 trainlog=${month}_train.txt
@@ -12,7 +12,7 @@ data:
 
 train:
 	uv run src/train.py \
-		--outdir ./output/tfidf_tune/achar_wb_n2-4_f100000_alpha0.0001_penl2_ros \
+		--outdir ./output/2025_up_to_month_7 \
 		--modelsdir ./models \
 		--outmodel achar_wb_n2-4_f100000_alpha0.0001_penl2_ros.joblib \
 		--max-epochs 60 \
@@ -26,7 +26,6 @@ train:
 		--train-file train.csv \
 		--eval-file eval.csv \
 		--calibrate none \
-		--class-weight-balanced \
 		--shuffle
 
 eval:

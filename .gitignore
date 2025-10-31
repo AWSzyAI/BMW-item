@@ -10,4 +10,5 @@ settings.json
 .vscode/
 .python-version
 /models/
-.python-version
+main.py
+uv.lock

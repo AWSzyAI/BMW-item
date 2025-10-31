@@ -37,56 +37,115 @@ except Exception:
 from collections import Counter
 
 
+# def _read_split_or_combined(base_dir: str, base_filename: str) -> pd.DataFrame:
+#     """读取数据集，优先支持 X/Y 分离文件，其次回退到单表 CSV。
+
+#     约定：
+#     - 若传入 train.csv/test.csv/eval.csv，则优先查找同目录下的 train_X.csv + train_y.csv 等；
+#     - X 文件应包含文本特征列：case_title、performed_work（可选 item_title 等）；
+#     - y 文件应至少包含 'linked_items' 列。
+#     返回值为合并后的 DataFrame（X 列 + linked_items 列）。
+#     """
+#     # 绝对路径优先，其次 base_dir 拼接
+#     def _cand(p: str):
+#         return p if (p and os.path.isabs(p) and os.path.exists(p)) else None
+
+#     # 计算 stem（去掉 .csv 和可能的 _X/_y 后缀）
+#     name = os.path.basename(base_filename)
+#     stem = os.path.splitext(name)[0]
+#     if stem.endswith("_X"):
+#         stem = stem[:-2]
+#     if stem.endswith("_y"):
+#         stem = stem[:-2]
+
+#     # 可能的文件名
+#     x_name = f"{stem}_X.csv"
+#     y_name = f"{stem}_y.csv"
+
+#     # 1) 绝对路径的 X/Y
+#     x_abs = _cand(base_filename)  # 若本身就是一个存在的绝对路径（很少见）
+#     if x_abs and x_abs.endswith("_X.csv"):
+#         y_abs = x_abs[:-6] + "_y.csv"
+#         if os.path.exists(y_abs):
+#             X_df = pd.read_csv(x_abs)
+#             y_df = pd.read_csv(y_abs)
+#             if "linked_items" not in y_df.columns:
+#                 raise KeyError(f"{y_abs} 缺少列：linked_items")
+#             df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+#             return df
+
+#     # 2) base_dir 下的 X/Y
+#     x_path = os.path.join(base_dir, x_name)
+#     y_path = os.path.join(base_dir, y_name)
+#     if os.path.exists(x_path) and os.path.exists(y_path):
+#         X_df = pd.read_csv(x_path)
+#         y_df = pd.read_csv(y_path)
+#         if "linked_items" not in y_df.columns:
+#             raise KeyError(f"{y_path} 缺少列：linked_items")
+#         df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+#         return df
+
+#     # 3) 回退：读取单表 CSV（绝对路径优先，再 base_dir）
+#     return _flex_read_csv(base_dir, base_filename)
+
+
+
 def _read_split_or_combined(base_dir: str, base_filename: str) -> pd.DataFrame:
-    """读取数据集，优先支持 X/Y 分离文件，其次回退到单表 CSV。
+    """优先读取 X/Y 分离文件；若不存在则回退到单表 CSV。
 
     约定：
-    - 若传入 train.csv/test.csv/eval.csv，则优先查找同目录下的 train_X.csv + train_y.csv 等；
-    - X 文件应包含文本特征列：case_title、performed_work（可选 item_title 等）；
-    - y 文件应至少包含 'linked_items' 列。
-    返回值为合并后的 DataFrame（X 列 + linked_items 列）。
+    - base_filename 可为 train.csv / eval.csv 或 train_X.csv / eval_X.csv；
+    - 若为单表名，将尝试在 base_dir 下寻找 <stem>_X.csv 与 <stem>_y.csv；
+    - X 文件应包含文本特征列（如 case_title、performed_work 等），
+      y 文件至少包含 'linked_items'（若为 'label'/'y' 会自动重命名）。
     """
-    # 绝对路径优先，其次 base_dir 拼接
-    def _cand(p: str):
-        return p if (p and os.path.isabs(p) and os.path.exists(p)) else None
-
-    # 计算 stem（去掉 .csv 和可能的 _X/_y 后缀）
+    base_dir = os.path.abspath(base_dir)
     name = os.path.basename(base_filename)
-    stem = os.path.splitext(name)[0]
+    stem, ext = os.path.splitext(name)
+    # 兼容传入 *_X.csv 或 *_y.csv 的情况，统一回到公共 stem
     if stem.endswith("_X"):
         stem = stem[:-2]
     if stem.endswith("_y"):
         stem = stem[:-2]
 
-    # 可能的文件名
     x_name = f"{stem}_X.csv"
     y_name = f"{stem}_y.csv"
 
-    # 1) 绝对路径的 X/Y
-    x_abs = _cand(base_filename)  # 若本身就是一个存在的绝对路径（很少见）
-    if x_abs and x_abs.endswith("_X.csv"):
-        y_abs = x_abs[:-6] + "_y.csv"
-        if os.path.exists(y_abs):
-            X_df = pd.read_csv(x_abs)
-            y_df = pd.read_csv(y_abs)
-            if "linked_items" not in y_df.columns:
-                raise KeyError(f"{y_abs} 缺少列：linked_items")
-            df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
-            return df
+    def _exists_in_dir(fname: str) -> str | None:
+        p = os.path.join(base_dir, fname)
+        return p if os.path.exists(p) else None
 
-    # 2) base_dir 下的 X/Y
-    x_path = os.path.join(base_dir, x_name)
-    y_path = os.path.join(base_dir, y_name)
-    if os.path.exists(x_path) and os.path.exists(y_path):
-        X_df = pd.read_csv(x_path)
-        y_df = pd.read_csv(y_path)
-        if "linked_items" not in y_df.columns:
-            raise KeyError(f"{y_path} 缺少列：linked_items")
-        df = pd.concat([X_df.reset_index(drop=True), y_df[["linked_items"]].reset_index(drop=True)], axis=1)
+    # 1) 优先尝试分表
+    x_path = _exists_in_dir(x_name)
+    y_path = _exists_in_dir(y_name)
+    if x_path and y_path:
+        X = _flex_read_csv(base_dir, os.path.basename(x_path))
+        y = _flex_read_csv(base_dir, os.path.basename(y_path))
+
+        # 兼容 y 列名
+        if "linked_items" not in y.columns:
+            if "label" in y.columns:
+                y = y.rename(columns={"label": "linked_items"})
+            elif "y" in y.columns:
+                y = y.rename(columns={"y": "linked_items"})
+            else:
+                # 若多列，取第一列作为标签
+                first_label_col = y.columns[0]
+                warnings.warn(f"未找到 'linked_items'，使用 '{first_label_col}' 作为标签列")
+                y = y.rename(columns={first_label_col: "linked_items"})
+
+        # 只保留标签列
+        y = y[["linked_items"]]
+        if len(X) != len(y):
+            raise ValueError(f"X/Y 行数不一致：X={len(X)} Y={len(y)}（stem={stem}）")
+        df = pd.concat([X.reset_index(drop=True), y.reset_index(drop=True)], axis=1)
         return df
 
-    # 3) 回退：读取单表 CSV（绝对路径优先，再 base_dir）
-    return _flex_read_csv(base_dir, base_filename)
+    # 2) 回退：读取单表（例如 train.csv / eval.csv）
+    warnings.warn(
+        f"未找到分表 {x_name}+{y_name}，回退到单表 {name}（目录：{base_dir}）"
+    )
+    return _flex_read_csv(base_dir, name)
 
 
 class LossCallback:
