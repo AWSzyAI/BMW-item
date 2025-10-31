@@ -357,7 +357,7 @@ def main(args):
             X_tr_vec, y_tr = _simple_ros_sparse_or_dense(X_tr_vec, y_tr)
 
         n_after = X_tr_vec.shape[0]  # 稀疏/稠密/ndarray 都有 shape
-        print(f"[Info] 采样后训练集样本数: {n_after} | label分布: {Counter(y_tr)}")
+        print(f"[Info] 采样后训练集样本数: {n_after} ")
     # ========== 不平衡处理结束 ==========
 
     # 逐 epoch 训练并记录 loss
