@@ -3,6 +3,7 @@
 把Makefile中的month换成对应的月份
 
 ```bash
+python 2025.py #从data生成每个月的数据集
 make
 ```
 
@@ -119,3 +120,25 @@ python src/tfidf_tune.py \
 
 ```
 
+modelscope download --model 'google-bert/bert-base-chinese' --local_dir './models'
+
+BERT
+```
+python src/train_bert.py \
+    --bert-model ./models/bert-base-chinese \
+    --num-train-epochs 3.0 \
+    --train-batch-size 16 \
+    --eval-batch-size 32
+
+python src/predict_bert.py \
+    --modelsdir ./models \
+    --model bert_model.joblib \
+    --infile eval.csv
+
+python src/eval_bert.py \
+    --modeldir ./models \
+    --model bert_model.joblib \
+    --path eval.csv \
+    --mode new
+
+```

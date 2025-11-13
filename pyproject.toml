@@ -5,14 +5,20 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "addict>=2.4.0",
+    "datasets>=4.4.1",
     "imblearn>=0.0",
     "ipykernel>=7.1.0",
     "ipython>=8.37.0",
     "matplotlib>=3.10.7",
+    "modelscope>=1.31.0",
     "numpy>=2.2.6",
     "openai>=2.6.1",
     "pandas>=2.3.3",
+    "protobuf>=6.33.0",
     "scikit-learn>=1.7.2",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
 ]
 
 [[tool.uv.index]]

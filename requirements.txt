@@ -6,3 +6,8 @@ numpy
 matplotlib
 scikit-learn
 imblearn
+torch
+transformers
+datasets
+addict
+modelscope

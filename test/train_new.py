@@ -48,11 +48,11 @@ def main():
     args = parser.parse_args()
 
     if args.strategy == "tfidf":
-        from tf_idf import train_tfidf
+        from test.tf_idf import train_tfidf
 
         train_tfidf(args)
     elif args.strategy == "bert":
-        from BERT import main as bert_main
+        from test.BERT import main as bert_main
 
         bert_main(args)
 
