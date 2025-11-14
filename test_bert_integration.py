@@ -66,7 +66,10 @@ def test_bert_training(temp_dir, train_path, eval_path):
         '--num-train-epochs', '1.0',  # 只训练1个epoch用于测试
         '--train-batch-size', '4',
         '--eval-batch-size', '8',
-        '--max-length', '128'
+        '--max-length', '128',
+        '--skip-train-stats', 'True',
+        '--post-train-stats-batch-size', '4',
+        '--stats-on-cpu', 'True'
     ]
     
     print(f"运行命令: {' '.join(cmd)}")

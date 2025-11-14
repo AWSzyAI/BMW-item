@@ -5,6 +5,8 @@
 ```bash
 python 2025.py #从data生成每个月的数据集
 make
+uv run src/train_bert.py --bert-model ./models/google-bert/bert-base-chinese --skip-train-stats True --stats-on-cpu True --post-train-stats-batch-size 4 --num-train-epochs 1 --train-batch-size 4 --eval-batch-size 8 --max-length 128
+
 ```
 
 ### Result

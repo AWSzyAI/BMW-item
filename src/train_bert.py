@@ -6,6 +6,7 @@
 """
 
 import os, json, argparse, warnings, time
+import gc
 import numpy as np
 import pandas as pd
 # 可选依赖：matplotlib
@@ -18,6 +19,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import log_loss, accuracy_score, f1_score
 import joblib
 from tqdm import tqdm
+from contextlib import nullcontext
 
 warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
@@ -42,6 +44,10 @@ try:
 except Exception:
     SMOTE = SMOTEENN = SMOTETomek = RandomOverSampler = None
     _HAS_IMBLEARN = False
+
+
+def _str2bool(v) -> bool:
+    return str(v).lower() in {"1", "true", "t", "y", "yes"}
 
 
 def _is_valid_local_hf_dir(path: str) -> bool:
@@ -228,6 +234,38 @@ class BERTModelWrapper:
         """预测类别"""
         proba = self.predict_proba(texts)
         return self.label_encoder.inverse_transform(np.argmax(proba, axis=1))
+
+
+def _predict_proba_in_batches(model, tokenizer, texts, device, max_length, batch_size=16, use_amp=False):
+    """分批计算文本的类别概率，避免一次性占满显存"""
+    if isinstance(texts, str):
+        texts = [texts]
+    model.eval()
+    all_probs: list[torch.Tensor] = []
+    amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16) if (use_amp and isinstance(device, torch.device) and device.type == 'cuda') else nullcontext()
+    with torch.inference_mode(), amp_ctx:
+        for i in range(0, len(texts), int(batch_size)):
+            batch_texts = texts[i:i + int(batch_size)]
+            enc = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=int(max_length),
+                return_tensors='pt'
+            )
+            enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+            out = model(**enc)
+            probs = torch.softmax(out.logits, dim=-1).to('cpu')
+            all_probs.append(probs)
+            del enc, out
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+    if not all_probs:
+        return np.zeros((0, 0), dtype=np.float32)
+    return torch.cat(all_probs, dim=0).numpy()
 
 
 def main(args):
@@ -665,19 +703,66 @@ def main(args):
     else:
         print("⚠️  [提示] eval 集为空或无可评估样本，跳过评估。")
 
-    # 训练集/验证集概率，用于 OOD MSP 阈值
-    def _proba_for_texts(texts: list[str]) -> np.ndarray:
-        enc = tokenizer(texts, padding=True, truncation=True, max_length=int(args.max_length), return_tensors="pt")
-        enc = {k: v.to(device) for k, v in enc.items()}
-        model.eval()
-        with torch.no_grad():
-            out = model(**enc)
-            logits = out.logits.detach().cpu().numpy()
-            e = np.exp(logits - np.max(logits, axis=1, keepdims=True))
-            return e / e.sum(axis=1, keepdims=True)
+    # 训练集/验证集概率（分批），用于 OOD MSP 阈值
+    id_pmax_for_stats = None
+    try:
+        if not getattr(args, 'skip_train_stats', False):
+            print("\n📊 正在计算训练后统计（分批）...")
+            stats_device = torch.device('cpu') if getattr(args, 'stats_on_cpu', False) else torch.device(device)
+            moved_to_cpu = False
+            if getattr(args, 'stats_on_cpu', False) and (isinstance(device, str) and device != 'cpu' or isinstance(device, torch.device) and device.type != 'cpu'):
+                model.to('cpu')
+                moved_to_cpu = True
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            use_amp_stats = bool(getattr(args, 'fp16', False)) and (hasattr(stats_device, 'type') and stats_device.type == 'cuda')
+            probs_tr = _predict_proba_in_batches(
+                model=model,
+                tokenizer=tokenizer,
+                texts=X_tr,
+                device=stats_device,
+                max_length=int(args.max_length),
+                batch_size=int(getattr(args, 'post_train_stats_batch_size', 16)),
+                use_amp=use_amp_stats,
+            )
+            id_pmax_for_stats = probs_tr.max(axis=1)
+            if moved_to_cpu:
+                model.to(device)
+        else:
+            # 退化方案：使用 eval 的分布估计阈值；若 eval 为空则使用固定阈值
+            if len(X_ev_f) > 0:
+                print("\n📊 跳过训练集统计，改用评估集分布估计阈值（分批）...")
+                stats_device = torch.device('cpu') if getattr(args, 'stats_on_cpu', False) else torch.device(device)
+                moved_to_cpu = False
+                if getattr(args, 'stats_on_cpu', False) and (isinstance(device, str) and device != 'cpu' or isinstance(device, torch.device) and device.type != 'cpu'):
+                    model.to('cpu')
+                    moved_to_cpu = True
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                use_amp_stats = bool(getattr(args, 'fp16', False)) and (hasattr(stats_device, 'type') and stats_device.type == 'cuda')
+                probs_ev = _predict_proba_in_batches(
+                    model=model,
+                    tokenizer=tokenizer,
+                    texts=X_ev_f,
+                    device=stats_device,
+                    max_length=int(args.max_length),
+                    batch_size=int(getattr(args, 'post_train_stats_batch_size', 16)),
+                    use_amp=use_amp_stats,
+                )
+                id_pmax_for_stats = probs_ev.max(axis=1)
+                if moved_to_cpu:
+                    model.to(device)
+            else:
+                print("\n⚠️  跳过统计且评估集为空，使用默认阈值 0.1。")
+                id_pmax_for_stats = np.array([0.1])
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
-    # OOD 检测：与 TF-IDF 逻辑一致，阈值基于 train 分布（或 eval 中 ID 样本）
-    id_pmax_for_stats = _proba_for_texts(X_tr).max(axis=1)
     tau = float(np.percentile(id_pmax_for_stats, getattr(args, "ooc_tau_percentile", 5.0)))
     temperature = float(getattr(args, "ooc_temperature", 20.0))
     ooc_detector = {"kind": "threshold", "tau": tau, "temperature": temperature}
@@ -783,7 +868,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--fp16", action="store_true", help="启用混合精度训练（仅CUDA）")
     parser.add_argument("--save-hf-dir", type=str, default=None, help="保存 Hugging Face 模型与分词器的目录（默认 models/<stem>_bert）")
-    parser.add_argument("--allow-online", action="store_true", help="允许在线下载模型")
+    # 在线/离线
+    parser.add_argument("--allow-online", type=_str2bool, default=False, help="允许在线下载HF模型（True/False）")
     
     # 早停参数
     parser.add_argument("--early-stopping-patience", type=int, default=3, help="早停耐心值（若连续 N 个 epoch 未提升则停止）")
@@ -791,6 +877,10 @@ if __name__ == "__main__":
     # OOD/MSP
     parser.add_argument("--ooc-tau-percentile", type=float, default=5.0, help="无 OOD 正样本时，p_max 的分位数阈值（百分位）")
     parser.add_argument("--ooc-temperature", type=float, default=20.0, help="将 (tau - p_max) 经 sigmoid 映射为概率的温度系数")
+    # 训练后统计
+    parser.add_argument("--skip-train-stats", type=_str2bool, default=False, help="训练后跳过对训练集整表概率/统计的计算（True/False）")
+    parser.add_argument("--post-train-stats-batch-size", type=int, default=16, help="训练后计算概率的batch size")
+    parser.add_argument("--stats-on-cpu", type=_str2bool, default=False, help="训练后统计阶段在CPU上执行（True/False）")
     
     # 不平衡处理参数
     parser.add_argument(

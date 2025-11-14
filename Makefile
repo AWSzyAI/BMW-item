@@ -36,6 +36,7 @@ predict:
 
 # 删除.gitignore对应的所有内容
 clean:
+	rm -rf ${outdir} log/
 
 
 .PHONY: all train eval predict data
