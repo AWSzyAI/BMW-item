@@ -17,6 +17,19 @@ try:
 except Exception:
     pass
 
+# 兼容从 train_bert.py 序列化的 BERT 包装器（BERTModelWrapper、LossRecorder 等）
+try:
+    import train_bert as _train_bert_module  # noqa: F401
+    _mod = sys.modules.get("__main__")
+    if _mod is not None:
+        # 某些情况下，joblib 在保存时记录的模块为 __main__，需要在当前 __main__ 注入同名类
+        for _name in ("BERTModelWrapper", "LossRecorder"):
+            if hasattr(_train_bert_module, _name) and not hasattr(_mod, _name):
+                setattr(_mod, _name, getattr(_train_bert_module, _name))
+except Exception:
+    # 若未找到也不致命；仅在反序列化 BERT 模型 bundle 时需要
+    pass
+
 def _ooc_prob_from_detector(ooc_detector, p_max_scalar: float, override_tau: float | None = None) -> float:
     """从保存的 ooc_detector 计算 not-in-train 概率。
     支持两种形式：
@@ -54,9 +67,54 @@ def main(args):
     if not os.path.exists(bundle_path):
         raise FileNotFoundError(f"Model not found: {bundle_path}")
     bundle = joblib.load(bundle_path)
-    model = bundle["model"]
-    le = bundle["label_encoder"]
+    model = bundle.get("model")
+    le = bundle.get("label_encoder")
     ooc_detector = bundle.get("ooc_detector")
+    model_type = bundle.get("model_type", None)
+
+    # 若为 BERT 训练生成的 bundle
+    if model_type == "bert":
+        # 尝试对设备进行校正（防止在GPU环境保存而在CPU环境加载导致的设备不匹配）
+        try:
+            import torch  # 延迟导入
+            if model is not None and hasattr(model, "device"):
+                desired = torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+                # 有些情况下 device 可能保存为字符串
+                try:
+                    saved = str(model.device)
+                except Exception:
+                    saved = str(model.device) if model.device is not None else ""
+                if (("cuda" in saved or "mps" in saved) and desired.type == "cpu") or ("cpu" in saved and desired.type in ("cuda", "mps")):
+                    model.device = desired
+        except Exception:
+            pass
+
+        # 若未能直接反序列化出包装器，则尝试基于保存的 HF 目录重建
+        if model is None or not hasattr(model, "predict_proba"):
+            try:
+                # 从 bundle 读取保存的 HF 目录与标签编码器
+                model_dir = bundle.get("model_dir")
+                if model_dir is None or le is None:
+                    raise RuntimeError("BERT bundle 缺少 model_dir 或 label_encoder")
+                # 动态获取包装器类
+                from train_bert import BERTModelWrapper  # type: ignore
+                # 选择设备
+                import torch
+                device = torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+                # 分词器：直接从 HF 目录加载（BERTModelWrapper.fit 内部会加载模型）
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+                model = BERTModelWrapper(model_dir, tokenizer, le, device)
+            except Exception as e:
+                raise RuntimeError(f"无法重建 BERT 模型：{e}")
 
     # 读取输入样本（支持 *_X.csv + *_y.csv 分离，或单表）
     outdir = args.outdir
@@ -189,6 +247,22 @@ def predict(texts, model_path=None, top_k=10):
     bundle = joblib.load(model_path)
     model = bundle.get("model")
     le = bundle.get("label_encoder")
+    model_type = bundle.get("model_type", None)
+    if model_type == "bert" and (model is None or not hasattr(model, "predict_proba")):
+        # 与 main 中一致的回退：基于保存的 HF 目录重建包装器
+        model_dir = bundle.get("model_dir")
+        if model_dir is None or le is None:
+            raise ValueError("BERT bundle 缺少 model_dir 或 label_encoder。")
+        from train_bert import BERTModelWrapper  # type: ignore
+        from transformers import AutoTokenizer
+        import torch
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else (
+                "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+            )
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+        model = BERTModelWrapper(model_dir, tokenizer, le, device)
     if model is None or le is None:
         raise ValueError("Loaded bundle does not contain 'model' and 'label_encoder'.")
 

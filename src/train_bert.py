@@ -188,48 +188,88 @@ def _compute_metrics(eval_pred, num_labels: int) -> dict:
 
 
 class BERTModelWrapper:
-    """BERT模型包装器，兼容sklearn接口"""
+    """BERT模型包装器，兼容sklearn接口，支持懒加载与分批推理以避免显存溢出"""
     def __init__(self, model_path, tokenizer, label_encoder, device='cpu'):
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.label_encoder = label_encoder
-        self.device = device
+        # 统一为 torch.device
+        try:
+            self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        except Exception:
+            self.device = torch.device('cpu')
         self.model = None
-        
-    def fit(self, X=None, y=None):
-        """加载已训练的模型"""
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            self.model_path,
-            local_files_only=True
-        )
-        self.model.to(self.device)
-        self.model.eval()
-        return self
-    
-    def predict_proba(self, texts):
-        """预测概率"""
+
+    def _ensure_model(self):
+        """确保底层HF模型已加载至 self.model，并移动到 self.device。"""
         if self.model is None:
-            self.fit()
-        
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                self.model_path,
+                local_files_only=True
+            )
+            self.model.to(self.device)
+            self.model.eval()
+
+    def fit(self, X=None, y=None):
+        """加载已训练的模型（与 sklearn 接口对齐）。"""
+        self._ensure_model()
+        return self
+
+    def predict_proba_batched(self, texts, batch_size: int = 16, max_length: int = 256):
+        """分批预测概率，自动在 CUDA/MPS/CPU 之间选择，并在 OOM 时回退。"""
         if isinstance(texts, str):
             texts = [texts]
-        
-        encodings = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=256,
-            return_tensors="pt"
-        )
-        encodings = {k: v.to(self.device) for k, v in encodings.items()}
-        
-        with torch.no_grad():
-            outputs = self.model(**encodings)
-            logits = outputs.logits
-            probabilities = torch.softmax(logits, dim=-1)
-        
-        return probabilities.cpu().numpy()
-    
+        # 确保模型加载
+        self._ensure_model()
+        # 设备与尝试序列
+        devs = []
+        try:
+            if torch.cuda.is_available():
+                devs.append(torch.device('cuda'))
+            if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+                devs.append(torch.device('mps'))
+        except Exception:
+            pass
+        devs.append(torch.device('cpu'))
+
+        last_err = None
+        for dev in devs:
+            try:
+                # 移动模型到目标设备
+                try:
+                    self.model.to(dev)
+                    self.device = dev
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                # 逐步缩小 batch size
+                for bs in [batch_size, max(1, batch_size // 2), max(1, batch_size // 4)]:
+                    use_amp = (isinstance(dev, torch.device) and dev.type == 'cuda')
+                    probs = _predict_proba_in_batches(
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        texts=texts,
+                        device=dev,
+                        max_length=max_length,
+                        batch_size=int(bs),
+                        use_amp=use_amp,
+                    )
+                    return probs
+            except Exception as e:
+                last_err = e
+                # OOM 或设备错误则继续尝试下一种组合
+                continue
+        # 若所有尝试均失败，则抛出最后的异常
+        if last_err is not None:
+            raise last_err
+        # 极端兜底（理论上不会到此）
+        return np.zeros((0, 0), dtype=np.float32)
+
+    def predict_proba(self, texts):
+        """预测概率（默认走分批推理，安全且稳健）。"""
+        return self.predict_proba_batched(texts, batch_size=16, max_length=256)
+
     def predict(self, texts):
         """预测类别"""
         proba = self.predict_proba(texts)
@@ -411,11 +451,31 @@ def main(args):
     if is_local:
         print("🔍 验证本地模型目录...")
         if not _is_valid_local_hf_dir(init_path):
-            raise RuntimeError(
-                f"本地模型目录不完整：{init_path}\n"
-                f"请确保包含至少 config.json 与 tokenizer.json 或 vocab.txt。\n"
-                f"可以先用 huggingface_hub.snapshot_download 下载到本地再指定 --init-hf-dir。"
-            )
+            # 尝试在其子目录中自动发现一个合法的HF模型目录（常见布局: ./models/<publisher>/<model_name>）
+            discovered = None
+            try:
+                for root, dirs, files in os.walk(init_path):
+                    # 只深入两层，避免扫描过多
+                    depth = root[len(init_path):].count(os.sep)
+                    if depth > 3:
+                        continue
+                    if "config.json" in files and ("tokenizer.json" in files or "vocab.txt" in files):
+                        discovered = root
+                        break
+                if discovered:
+                    print(f"[提示] 传入目录 {init_path} 不含模型文件，自动发现子目录: {discovered}")
+                    init_path = discovered  # 替换为真实模型路径
+                else:
+                    raise RuntimeError(
+                        f"本地模型目录不完整：{init_path}\n"
+                        f"未找到包含 config.json 与 tokenizer.json/vocab.txt 的子目录。\n"
+                        f"请使用 --bert-model 指向具体模型目录，例如: ./models/google-bert/bert-base-chinese"
+                    )
+            except Exception as e:
+                raise RuntimeError(
+                    f"本地模型目录不完整：{init_path}\n自动发现子目录时发生错误: {e}\n"
+                    f"请确保包含至少 config.json 与 tokenizer.json 或 vocab.txt。"
+                )
         print("📥 加载本地分词器...")
         tokenizer = AutoTokenizer.from_pretrained(init_path, local_files_only=True)
     else:

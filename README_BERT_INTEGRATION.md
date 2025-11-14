@@ -51,7 +51,14 @@ python src/train_bert.py \
 ### 4. 使用模型进行预测
 
 ```bash
-# 单样本预测
+# 单样本预测（两种入口等价，predict.py 现已支持 BERT 训练产生的 .joblib）
+python src/predict.py \
+    --modelsdir ./models \
+    --model bert_model.joblib \
+    --outdir ./output \
+    --infile eval.csv
+
+# 或使用专用入口
 python src/predict_bert.py \
     --modelsdir ./models \
     --model bert_model.joblib \
@@ -61,7 +68,7 @@ python src/predict_bert.py \
 
 ```python
 # 批量预测（在Python代码中）
-from src.predict_bert import predict
+from src.predict import predict  # predict.py 同样支持 BERT/TF-IDF 两种 bundle
 
 results = predict(
     texts=["发动机有异响", "刹车不灵敏"], 

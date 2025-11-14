@@ -6,6 +6,8 @@ import joblib
 from sklearn.metrics import (
     accuracy_score, f1_score
 )
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
 
 from utils import ensure_single_label, build_text, hit_at_k, eval_split
 
@@ -59,6 +61,82 @@ def _read_split_or_combined(outdir: str, base: str) -> tuple[pd.DataFrame, str]:
             used = os.path.splitext(os.path.basename(p))[0]
             return df, used
     raise FileNotFoundError(f"找不到评估数据文件：{base} 或 {os.path.join(outdir, base)} 或其分离版 X/Y")
+
+
+def _load_id2name_from_mapping(outdir: str, n_classes: int, label_encoder=None):
+    """优先从 outdir/label_mapping.csv 读取 id->原始类名 映射；失败则回退到 label_encoder.classes_。"""
+    mapping_path = os.path.join(outdir, "label_mapping.csv")
+    id2name = None
+    if os.path.isfile(mapping_path):
+        try:
+            mdf = pd.read_csv(mapping_path)
+            if {"label", "linked_items"}.issubset(mdf.columns):
+                tmp = mdf.dropna(subset=["label", "linked_items"]).copy()
+                tmp["label"] = tmp["label"].astype(int)
+                id2name = {int(r["label"]): str(r["linked_items"]) for _, r in tmp.iterrows()}
+        except Exception:
+            id2name = None
+    if id2name is None and label_encoder is not None:
+        try:
+            classes = label_encoder.inverse_transform(np.arange(n_classes))
+            id2name = {i: str(c) for i, c in enumerate(classes)}
+        except Exception:
+            id2name = {i: str(i) for i in range(n_classes)}
+    if id2name is None:
+        id2name = {i: str(i) for i in range(n_classes)}
+    return id2name
+
+
+def _plot_confusion_topk(y_true_ids: np.ndarray,
+                         y_pred_ids: np.ndarray,
+                         id2name: dict,
+                         outdir: str,
+                         top_k: int = 50,
+                         filename: str = "bert_confusion_matrix_cot.png"):
+    if y_true_ids is None or y_pred_ids is None or len(y_true_ids) == 0:
+        print("[Warn] 无法绘制混淆矩阵：y_true_ids 或 y_pred_ids 为空")
+        return
+    n_classes = max(int(max(y_true_ids.max(), y_pred_ids.max())) + 1, len(id2name))
+    cm = confusion_matrix(y_true_ids, y_pred_ids, labels=list(range(n_classes)))
+    counts = np.bincount(y_true_ids, minlength=n_classes)
+    valid = np.where(counts > 0)[0]
+    if len(valid) == 0:
+        print("[Warn] 测试集中无有效标签，跳过混淆矩阵绘制")
+        return
+    k = min(top_k, len(valid))
+    top_classes = valid[np.argsort(counts[valid])[-k:]]  # 频次Top-K
+    top_classes = top_classes[np.argsort(counts[top_classes])[::-1]]  # 频次降序
+    cm_top = cm[np.ix_(top_classes, top_classes)]
+
+    def _truncate(s, n=30):
+        s = str(s)
+        return s if len(s) <= n else s[:n] + "..."
+
+    tick_labels = [_truncate(id2name.get(i, str(i))) for i in top_classes]
+    # 动态放大，约每格0.22英寸 + 边距
+    fig_w = k * 0.22 + 4
+    fig_h = k * 0.22 + 4
+    plt.figure(figsize=(fig_w, fig_h))
+    im = plt.imshow(cm_top, interpolation='nearest', cmap='Blues')
+    plt.title(f"Confusion Matrix (Top-{k} by frequency)")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(ticks=np.arange(k), labels=tick_labels, rotation=90)
+    plt.yticks(ticks=np.arange(k), labels=tick_labels)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    # 数值标注
+    thresh = cm_top.max() / 2.0 if cm_top.size else 0
+    for i in range(cm_top.shape[0]):
+        for j in range(cm_top.shape[1]):
+            v = int(cm_top[i, j])
+            plt.text(j, i, str(v), ha='center', va='center',
+                     color='white' if v > thresh else 'black', fontsize=6)
+    plt.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
+    save_path = os.path.join(outdir, filename)
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Info] 混淆矩阵已保存: {save_path}")
 # def ensure_single_label(s):
 #     if isinstance(s, list):
 #         return str(s[0]) if s else ""
@@ -449,6 +527,21 @@ def main(args):
             out_path = os.path.join(outdir, "metrics_best_model_all_splits.csv")
             dfm.to_csv(out_path, index=False, encoding="utf-8-sig")
             print(f"\nBest model metrics saved to {out_path}")
+            # 追加：基于已知类别的混淆矩阵（Top-20）
+            try:
+                cls_set = set(le.classes_)
+                true_labels_orig = [str(t) for t in y_raw]
+                known_idx = [i for i, t in enumerate(true_labels_orig) if t in cls_set]
+                if len(known_idx) > 0:
+                    y_true_ids = le.transform([true_labels_orig[i] for i in known_idx])
+                    y_pred_ids = np.argmax(y_proba_all[known_idx], axis=1)
+                    n_classes = len(le.classes_)
+                    id2name = _load_id2name_from_mapping(outdir, n_classes, le)
+                    _plot_confusion_topk(y_true_ids, y_pred_ids, id2name, outdir, top_k=50, filename="bert_confusion_matrix_cot.png")
+                else:
+                    print("[Info] 测试集中无训练内类别样本，跳过混淆矩阵绘制")
+            except Exception as e:
+                print(f"[Warn] 绘制混淆矩阵失败: {e}")
             return
 
         # 未设置拒判阈值：沿用未知标签策略（exclude | map-to-other | tag-not-in-train）
@@ -540,6 +633,22 @@ def main(args):
         dfm.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"\nBest model metrics saved to {out_path}")
 
+        # 追加：基于已知类别的混淆矩阵（Top-20）
+        try:
+            cls_set = set(le.classes_)
+            true_labels_orig = [str(t) for t in y_raw]
+            known_idx = [i for i, t in enumerate(true_labels_orig) if t in cls_set]
+            if len(known_idx) > 0:
+                y_true_ids = le.transform([true_labels_orig[i] for i in known_idx])
+                y_pred_ids = np.argmax(y_proba_all[known_idx], axis=1)
+                n_classes = len(le.classes_)
+                id2name = _load_id2name_from_mapping(outdir, n_classes, le)
+                _plot_confusion_topk(y_true_ids, y_pred_ids, id2name, outdir, top_k=50, filename="bert_confusion_matrix_cot.png")
+            else:
+                print("[Info] 测试集中无训练内类别样本，跳过混淆矩阵绘制")
+        except Exception as e:
+            print(f"[Warn] 绘制混淆矩阵失败: {e}")
+
         return
 
     # 非 new 模式需要 folds.json
@@ -601,6 +710,27 @@ def main(args):
         print(f"\nBest model metrics saved to {out_path}")
     else:
         print("没有可保存的评估结果。")
+
+    # 非 new 模式：基于 test（优先）或 val 切分绘制混淆矩阵
+    try:
+        candidate = all_splits.get("test") or []
+        if not candidate:
+            candidate = all_splits.get("val") or []
+        if candidate:
+            Xs = [X_text[i] for i in candidate]
+            y_true_ids = le.transform([y_raw[i] for i in candidate])
+            y_pred = model.predict(Xs)
+            if isinstance(y_pred[0], str):
+                y_pred_ids = le.transform(y_pred)
+            else:
+                y_pred_ids = np.asarray(y_pred)
+            n_classes = len(le.classes_)
+            id2name = _load_id2name_from_mapping(outdir, n_classes, le)
+            _plot_confusion_topk(np.asarray(y_true_ids), np.asarray(y_pred_ids), id2name, outdir, top_k=50, filename="bert_confusion_matrix_cot.png")
+        else:
+            print("[Info] 无 test/val 切分可用于绘制混淆矩阵")
+    except Exception as e:
+        print(f"[Warn] 绘制混淆矩阵失败: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -12,8 +12,22 @@ import joblib
 from sklearn.metrics import (
     accuracy_score, f1_score
 )
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
 
 from utils import ensure_single_label, build_text, hit_at_k, eval_split
+
+# 兼容从 train_bert.py 序列化的 BERT 包装器（BERTModelWrapper、LossRecorder 等）
+try:
+    import train_bert as _train_bert_module  # noqa: F401
+    _mod = sys.modules.get("__main__")
+    if _mod is not None:
+        for _name in ("BERTModelWrapper", "LossRecorder"):
+            if hasattr(_train_bert_module, _name) and not hasattr(_mod, _name):
+                setattr(_mod, _name, getattr(_train_bert_module, _name))
+except Exception:
+    # 若未找到也不致命；仅在反序列化 BERT 模型 bundle 时需要
+    pass
 
 
 def _read_split_or_combined(outdir: str, base: str) -> tuple[pd.DataFrame, str]:
@@ -68,8 +82,126 @@ def _read_split_or_combined(outdir: str, base: str) -> tuple[pd.DataFrame, str]:
 
 
 def _compute_probs_bert(model, Xs_all):
-    """为BERT模型计算概率"""
+    """为BERT模型计算概率（分批，避免显存爆）"""
     try:
+        # 优先使用分批预测，减少显存占用
+        try:
+            import torch  # 延迟导入
+        except Exception:
+            torch = None
+
+        # 当加载的是我们保存的包装器时，具备 tokenizer/model/device
+        has_inner = hasattr(model, "tokenizer") and hasattr(model, "model")
+        if has_inner:
+            # 确保已加载底层 HF 模型
+            try:
+                if getattr(model, "model", None) is None and hasattr(model, "fit"):
+                    model.fit()
+            except Exception:
+                pass
+            # 若依然没有底层模型，优先使用包装器的分批接口或 predict_proba
+            if getattr(model, "model", None) is None:
+                if hasattr(model, "predict_proba_batched"):
+                    return model.predict_proba_batched(Xs_all, batch_size=16, max_length=256)
+                return model.predict_proba(Xs_all)
+            # 尝试复用 train_bert 内的分批函数
+            _ppb = None
+            try:
+                from train_bert import _predict_proba_in_batches as _ppb  # type: ignore
+            except Exception:
+                _ppb = None
+
+            def _local_ppb(_model, _tokenizer, _texts, _device, _max_len, _bs, _use_amp=False):
+                import numpy as _np
+                from contextlib import nullcontext as _nullctx
+                _model.eval()
+                out = []
+                if torch is not None and _use_amp and isinstance(_device, torch.device) and _device.type == 'cuda':
+                    amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+                else:
+                    amp_ctx = _nullctx()
+                with (_model.no_sync() if hasattr(_model, 'no_sync') else _nullctx()):
+                    pass  # 仅为占位，主循环里单独加 no_grad
+                with torch.inference_mode() if torch is not None else _nullctx():
+                    with amp_ctx:
+                        for i in range(0, len(_texts), int(_bs)):
+                            batch = _texts[i:i+int(_bs)]
+                            enc = _tokenizer(batch, padding=True, truncation=True, max_length=int(_max_len), return_tensors='pt')
+                            if torch is not None:
+                                enc = {k: v.to(_device, non_blocking=True) for k, v in enc.items()}
+                            logits = _model(**enc).logits
+                            if torch is not None:
+                                probs = torch.softmax(logits, dim=-1).to('cpu').numpy()
+                            else:
+                                probs = logits.detach().numpy()
+                            out.append(probs)
+                            if torch is not None and torch.cuda.is_available():
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                return _np.vstack(out) if out else _np.zeros((0, 0), dtype=float)
+
+            # 设备、批大小、序列长度
+            if torch is not None:
+                device = model.device if hasattr(model, "device") else torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+            else:
+                device = "cpu"
+            max_len = 256
+
+            def _run_ppb_on(dev, bs, use_amp):
+                if _ppb is not None:
+                    return _ppb(model.model, model.tokenizer, Xs_all, dev, max_len, bs, use_amp)
+                else:
+                    return _local_ppb(model.model, model.tokenizer, Xs_all, dev, max_len, bs, use_amp)
+
+            # 尝试序列：当前设备大批 -> 小批；失败则 CPU 大批 -> 小批
+            attempts = []
+            if torch is not None and isinstance(device, torch.device) and device.type in ("cuda", "mps"):
+                attempts.extend([(device, 16, device.type == 'cuda'), (device, 8, device.type == 'cuda'), (device, 4, device.type == 'cuda')])
+            # CPU 回退
+            cpu_dev = torch.device('cpu') if torch is not None else 'cpu'
+            attempts.extend([(cpu_dev, 16, False), (cpu_dev, 8, False), (cpu_dev, 4, False)])
+
+            last_err = None
+            for dev, bs, amp in attempts:
+                try:
+                    # 挪动模型到目标设备
+                    if torch is not None and hasattr(model, "model") and getattr(model, "model", None) is not None:
+                        model.model.to(dev)
+                        if hasattr(model, "device"):
+                            model.device = dev
+                        if torch.cuda.is_available():
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                    return _run_ppb_on(dev, int(bs), bool(amp))
+                except Exception as e:
+                    last_err = e
+                    msg = str(e).lower()
+                    # 若非显存相关错误且非 CUDA/MPS 设备，则直接跳过后续尝试
+                    if (torch is None) or (isinstance(dev, str) and dev == 'cpu'):
+                        continue
+                    if ("out of memory" not in msg) and ("cuda" not in msg) and ("mps" not in msg):
+                        # 非显存错误，继续尝试下一种设置
+                        continue
+                    # 否则继续降级尝试
+                    continue
+
+            # 若所有尝试均失败，回退到包装器一次性预测（可能会再次触发 OOM）
+            if hasattr(model, "predict_proba_batched"):
+                try:
+                    return model.predict_proba_batched(Xs_all, batch_size=8, max_length=256)
+                except Exception:
+                    pass
+            return model.predict_proba(Xs_all)
+
+        # 常规回退：使用包装器一次性预测
         return model.predict_proba(Xs_all)
     except Exception:
         raise RuntimeError("无法获得BERT模型的预测概率用于评估")
@@ -90,6 +222,82 @@ def _compute_probs_sklearn(model, Xs_all):
                 return e / e.sum(axis=1, keepdims=True)
         except Exception:
             raise RuntimeError("无法获得sklearn模型的预测概率用于评估")
+
+
+def _load_id2name_from_mapping(outdir: str, n_classes: int, label_encoder=None):
+    """优先从 outdir/label_mapping.csv 读取 id->原始类名 映射；失败则回退到 label_encoder.classes_。"""
+    mapping_path = os.path.join(outdir, "label_mapping.csv")
+    id2name = None
+    if os.path.isfile(mapping_path):
+        try:
+            mdf = pd.read_csv(mapping_path)
+            if {"label", "linked_items"}.issubset(mdf.columns):
+                tmp = mdf.dropna(subset=["label", "linked_items"]).copy()
+                tmp["label"] = tmp["label"].astype(int)
+                id2name = {int(r["label"]): str(r["linked_items"]) for _, r in tmp.iterrows()}
+        except Exception:
+            id2name = None
+    if id2name is None and label_encoder is not None:
+        try:
+            classes = label_encoder.inverse_transform(np.arange(n_classes))
+            id2name = {i: str(c) for i, c in enumerate(classes)}
+        except Exception:
+            id2name = {i: str(i) for i in range(n_classes)}
+    if id2name is None:
+        id2name = {i: str(i) for i in range(n_classes)}
+    return id2name
+
+
+def _plot_confusion_topk(y_true_ids: np.ndarray,
+                         y_pred_ids: np.ndarray,
+                         id2name: dict,
+                         outdir: str,
+                         top_k: int = 50,
+                         filename: str = "bert_confusion_matrix_cot.png"):
+    if y_true_ids is None or y_pred_ids is None or len(y_true_ids) == 0:
+        print("[Warn] 无法绘制混淆矩阵：y_true_ids 或 y_pred_ids 为空")
+        return
+    n_classes = max(int(max(y_true_ids.max(), y_pred_ids.max())) + 1, len(id2name))
+    cm = confusion_matrix(y_true_ids, y_pred_ids, labels=list(range(n_classes)))
+    counts = np.bincount(y_true_ids, minlength=n_classes)
+    valid = np.where(counts > 0)[0]
+    if len(valid) == 0:
+        print("[Warn] 测试集中无有效标签，跳过混淆矩阵绘制")
+        return
+    k = min(top_k, len(valid))
+    top_classes = valid[np.argsort(counts[valid])[-k:]]  # 频次Top-K
+    top_classes = top_classes[np.argsort(counts[top_classes])[::-1]]  # 频次降序
+    cm_top = cm[np.ix_(top_classes, top_classes)]
+
+    def _truncate(s, n=30):
+        s = str(s)
+        return s if len(s) <= n else s[:n] + "..."
+
+    tick_labels = [_truncate(id2name.get(i, str(i))) for i in top_classes]
+    # 动态放大，约每格0.22英寸 + 边距
+    fig_w = k * 0.22 + 4
+    fig_h = k * 0.22 + 4
+    plt.figure(figsize=(fig_w, fig_h))
+    im = plt.imshow(cm_top, interpolation='nearest', cmap='Blues')
+    plt.title(f"Confusion Matrix (Top-{k} by frequency)")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(ticks=np.arange(k), labels=tick_labels, rotation=90)
+    plt.yticks(ticks=np.arange(k), labels=tick_labels)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    # 数值标注
+    thresh = cm_top.max() / 2.0 if cm_top.size else 0
+    for i in range(cm_top.shape[0]):
+        for j in range(cm_top.shape[1]):
+            v = int(cm_top[i, j])
+            plt.text(j, i, str(v), ha='center', va='center',
+                     color='white' if v > thresh else 'black', fontsize=6)
+    plt.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
+    save_path = os.path.join(outdir, filename)
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Info] 混淆矩阵已保存: {save_path}")
 
 
 def main(args):
@@ -125,9 +333,48 @@ def main(args):
     
     # 检测模型类型
     model_type = bundle.get("model_type", "tfidf")
-    model = bundle["model"]
-    le = bundle["label_encoder"]
+    model = bundle.get("model")
+    le = bundle.get("label_encoder")
     ooc_detector = bundle.get("ooc_detector")
+
+    # 若是 BERT 模型，确保可用并处理可能的设备/反序列化问题
+    if model_type == "bert":
+        # 设备校正（避免 GPU/CPU 环境差异导致的问题）
+        try:
+            import torch  # 延迟导入
+            if model is not None and hasattr(model, "device"):
+                desired = torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+                try:
+                    saved = str(model.device)
+                except Exception:
+                    saved = str(model.device) if model.device is not None else ""
+                if (("cuda" in saved or "mps" in saved) and desired.type == "cpu") or ("cpu" in saved and desired.type in ("cuda", "mps")):
+                    model.device = desired
+        except Exception:
+            pass
+
+        # 若反序列化未得到可用包装器，则基于保存的 HF 目录重建
+        if model is None or not hasattr(model, "predict_proba"):
+            try:
+                model_dir = bundle.get("model_dir")
+                if model_dir is None or le is None:
+                    raise RuntimeError("BERT bundle 缺少 model_dir 或 label_encoder")
+                from train_bert import BERTModelWrapper  # type: ignore
+                from transformers import AutoTokenizer
+                import torch
+                device = torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+                tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+                model = BERTModelWrapper(model_dir, tokenizer, le, device)
+            except Exception as e:
+                raise RuntimeError(f"无法重建 BERT 模型：{e}")
 
     results = {}
 
@@ -437,6 +684,21 @@ def main(args):
             out_path = os.path.join(outdir, "metrics_best_model_all_splits.csv")
             dfm.to_csv(out_path, index=False, encoding="utf-8-sig")
             print(f"\nBest model metrics saved to {out_path}")
+            # 追加：基于已知类别的混淆矩阵（Top-20）
+            try:
+                cls_set = set(le.classes_)
+                true_labels_orig = [str(t) for t in y_raw]
+                known_idx = [i for i, t in enumerate(true_labels_orig) if t in cls_set]
+                if len(known_idx) > 0:
+                    y_true_ids = le.transform([true_labels_orig[i] for i in known_idx])
+                    y_pred_ids = np.argmax(y_proba_all[known_idx], axis=1)
+                    n_classes = len(le.classes_)
+                    id2name = _load_id2name_from_mapping(outdir, n_classes, le)
+                    _plot_confusion_topk(y_true_ids, y_pred_ids, id2name, outdir, top_k=50, filename="bert_confusion_matrix_cot.png")
+                else:
+                    print("[Info] 测试集中无训练内类别样本，跳过混淆矩阵绘制")
+            except Exception as e:
+                print(f"[Warn] 绘制混淆矩阵失败: {e}")
             return
 
         # 未设置拒判阈值：沿用未知标签策略（exclude | map-to-other | tag-not-in-train）
@@ -528,6 +790,22 @@ def main(args):
         dfm.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"\nBest model metrics saved to {out_path}")
 
+        # 追加：基于已知类别的混淆矩阵（Top-20）
+        try:
+            cls_set = set(le.classes_)
+            true_labels_orig = [str(t) for t in y_raw]
+            known_idx = [i for i, t in enumerate(true_labels_orig) if t in cls_set]
+            if len(known_idx) > 0:
+                y_true_ids = le.transform([true_labels_orig[i] for i in known_idx])
+                y_pred_ids = np.argmax(y_proba_all[known_idx], axis=1)
+                n_classes = len(le.classes_)
+                id2name = _load_id2name_from_mapping(outdir, n_classes, le)
+                _plot_confusion_topk(y_true_ids, y_pred_ids, id2name, outdir, top_k=50, filename="bert_confusion_matrix_cot.png")
+            else:
+                print("[Info] 测试集中无训练内类别样本，跳过混淆矩阵绘制")
+        except Exception as e:
+            print(f"[Warn] 绘制混淆矩阵失败: {e}")
+
         return
 
     # 非 new 模式需要 folds.json
@@ -589,6 +867,27 @@ def main(args):
         print(f"\nBest model metrics saved to {out_path}")
     else:
         print("没有可保存的评估结果。")
+
+    # 非 new 模式：基于 test（优先）或 val 切分绘制混淆矩阵
+    try:
+        candidate = all_splits.get("test") or []
+        if not candidate:
+            candidate = all_splits.get("val") or []
+        if candidate:
+            Xs = [X_text[i] for i in candidate]
+            y_true_ids = le.transform([y_raw[i] for i in candidate])
+            y_pred = model.predict(Xs)
+            if isinstance(y_pred[0], str):
+                y_pred_ids = le.transform(y_pred)
+            else:
+                y_pred_ids = np.asarray(y_pred)
+            n_classes = len(le.classes_)
+            id2name = _load_id2name_from_mapping(outdir, n_classes, le)
+            _plot_confusion_topk(np.asarray(y_true_ids), np.asarray(y_pred_ids), id2name, outdir, top_k=50, filename="bert_confusion_matrix_cot.png")
+        else:
+            print("[Info] 无 test/val 切分可用于绘制混淆矩阵")
+    except Exception as e:
+        print(f"[Warn] 绘制混淆矩阵失败: {e}")
 
 
 if __name__ == "__main__":

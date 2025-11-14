@@ -7,7 +7,43 @@ python 2025.py #从data生成每个月的数据集
 make
 uv run src/train_bert.py --bert-model ./models/google-bert/bert-base-chinese --skip-train-stats True --stats-on-cpu True --post-train-stats-batch-size 4 --num-train-epochs 1 --train-batch-size 4 --eval-batch-size 8 --max-length 128
 
+uv run src/train_bert.py \
+  --train-file train.csv \
+  --eval-file eval.csv \
+  --outdir ./output/2025_up_to_month_2 \
+  --modelsdir ./models \
+  --outmodel bert_model.joblib \
+  --bert-model ./models/google-bert/bert-base-chinese \
+  --allow-online False \
+  --num-train-epochs 3.0 \
+  --train-batch-size 16 \
+  --eval-batch-size 32 \
+  --max-length 256
+
+uv run src/predict.py --modelsdir ./models --model bert_model.joblib --outdir ./output/2025_up_to_month_2 --infile eval.csv
+
+
+uv run src/eval_bert.py --modeldir ./models --model bert_model.joblib --outdir ./output/2025_up_to_month_2 --path eval.csv --mode new
+
+uv run src/eval_bert.py --modeldir ./models --model bert_model.joblib --outdir ./output/2025_up_to_month_2 --path eval.csv --mode new --reject-threshold 0.7
+
+uv run src/eval_bert.py --modeldir ./models --model bert_model.joblib --outdir ./output/2025_up_to_month_2 --path eval.csv --mode new --sweep-thresholds "0.5:0.9:0.05"
+
+在 Makefile 顶部修改标签列为 extern_id：
+
 ```
+labelcol=extern_id
+```
+
+然后执行：
+
+```
+make data
+make train
+make eval
+```
+```
+
 
 ### Result
 ```bash

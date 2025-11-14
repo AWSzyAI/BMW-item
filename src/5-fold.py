@@ -88,14 +88,25 @@ def read_input(path: str, outdir: str) -> pd.DataFrame:
 
 def main(args):
     os.makedirs(args.outdir, exist_ok=True)
-    df = read_input(args.path, args.outdir)
-    for col in ["case_title", "performed_work", "linked_items"]:
+    # 若未提供 --path，则默认使用 --outdir 作为输入目录
+    in_path = args.path if (hasattr(args, 'path') and args.path and str(args.path).strip()) else args.outdir
+    df = read_input(in_path, args.outdir)
+    for col in ["case_title", "performed_work"]:
         if col not in df.columns:
             raise KeyError(f"输入缺少列：{col}")
+    # 标签列选择：linked_items 或 extern_id（默认 linked_items）
+    label_col = str(getattr(args, "label_col", "linked_items"))
 
-    # 规范标签
+    # 规范标签：
+    # 情况A：输入目录包含 y_train.csv -> 合并后已有 'linked_items' 工作列（数值或字符串均可）；直接使用
+    # 情况B：单表/原始数据 -> 若存在 label_col，则写回工作列 'linked_items'
     df = df.copy()
-    df["linked_items"] = df["linked_items"].apply(ensure_single_label).astype(str)
+    if "linked_items" in df.columns and (label_col == "linked_items" or label_col not in df.columns):
+        df["linked_items"] = df["linked_items"].apply(ensure_single_label).astype(str)
+    elif label_col in df.columns:
+        df["linked_items"] = df[label_col].apply(ensure_single_label).astype(str)
+    else:
+        raise KeyError(f"输入缺少标签列：{label_col}，且未在输入中发现标准列 linked_items")
 
     # 可选：将少见标签并入 __OTHER__
     min_count = int(args.min_count)
@@ -158,6 +169,36 @@ def main(args):
         print(
             f"[kfold] Saved: train({len(df_train)}) -> {tr_X}, {tr_y} | eval({len(df_eval)}) -> {ev_X}, {ev_y} | also single: {tr_single}, {ev_single} | k={k}, fold={fold_index}"
         )
+        # 复用上游（2025.py）生成的 label_mapping.csv；若不存在则写出最小映射
+        mapping_path = os.path.join(args.outdir, 'label_mapping.csv')
+        if os.path.exists(mapping_path):
+            print(f"[kfold] 复用已存在的映射：{mapping_path}")
+        else:
+            labels_order = sorted(df_train['linked_items'].unique())
+            mapping_df = pd.DataFrame({
+                'linked_items': labels_order,
+                'label': range(len(labels_order)),
+                'item_title': ["" for _ in labels_order],
+                'extern_id': ["" for _ in labels_order],
+                'orig_linked_items': labels_order,
+            })
+            # 统一转换为不带小数点的字符串
+            def _fmt_no_decimal(x):
+                if pd.isna(x):
+                    return ""
+                s = str(x).strip()
+                if s == "":
+                    return ""
+                try:
+                    v = float(s)
+                    if v.is_integer():
+                        return str(int(v))
+                except Exception:
+                    pass
+                return s
+            mapping_df = mapping_df.applymap(_fmt_no_decimal)
+            mapping_df.to_csv(mapping_path, index=False, encoding='utf-8-sig')
+            print(f"[kfold] 缺少上游映射，已写出最小映射：{mapping_path}")
     else:
         # 兼容旧逻辑：按比例分层 + 可选 3 路切分
         rng = pd.Series(range(len(df))).sample(frac=1.0, random_state=args.seed).index  # for stable shuffle order
@@ -218,15 +259,46 @@ def main(args):
         else:
             msg.append(f"also single: {tr_single}, {ev_single}")
         print(f"[ratio] Saved: {' | '.join(msg)} | train_ratio={train_ratio}")
+        # 复用上游（2025.py）生成的 label_mapping.csv；若不存在则写出最小映射
+        mapping_path = os.path.join(args.outdir, 'label_mapping.csv')
+        if os.path.exists(mapping_path):
+            print(f"[ratio] 复用已存在的映射：{mapping_path}")
+        else:
+            labels_order = sorted(df_train['linked_items'].unique())
+            mapping_df = pd.DataFrame({
+                'linked_items': labels_order,
+                'label': range(len(labels_order)),
+                'item_title': ["" for _ in labels_order],
+                'extern_id': ["" for _ in labels_order],
+                'orig_linked_items': labels_order,
+            })
+            # 统一转换为不带小数点的字符串
+            def _fmt_no_decimal(x):
+                if pd.isna(x):
+                    return ""
+                s = str(x).strip()
+                if s == "":
+                    return ""
+                try:
+                    v = float(s)
+                    if v.is_integer():
+                        return str(int(v))
+                except Exception:
+                    pass
+                return s
+            mapping_df = mapping_df.applymap(_fmt_no_decimal)
+            mapping_df.to_csv(mapping_path, index=False, encoding='utf-8-sig')
+            print(f"[ratio] 缺少上游映射，已写出最小映射：{mapping_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, default="./output/2025_up_to_month_2", help="输入路径：可为 CSV 文件，或包含 X.csv 与 y.csv 的文件夹")
+    parser.add_argument("--path", type=str, default="", help="输入路径：可为 CSV 文件，或包含 X.csv 与 y.csv 的文件夹；留空则使用 --outdir")
     parser.add_argument("--outdir", type=str, default="./output", help="输出目录")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--min_count", type=int, default=5, help="少见标签阈值与最低样本数要求（建议与 k 相同）")
     parser.add_argument("--map_rare_to_other", action="store_true", help="将少见标签映射为 __OTHER__")
+    parser.add_argument("--label-col", dest="label_col", type=str, default="linked_items", help="作为标签的列名：linked_items 或 extern_id（默认 linked_items）")
     # 新增：kfold 参数
     parser.add_argument("--method", type=str, default="kfold", choices=["kfold", "ratio"], help="切分方法：kfold 或 ratio")
     parser.add_argument("--k", type=int, default=5, help="kfold 的折数")

@@ -8,7 +8,6 @@
 import os, argparse, random, sys
 import numpy as np
 import joblib
-import torch
 from utils import _flex_read_csv, build_text, ensure_single_label
 import pandas as pd
 
@@ -21,6 +20,17 @@ try:
     _mod = sys.modules.get("__main__")
     if _mod is not None and not hasattr(_mod, "LossCallback"):
         setattr(_mod, "LossCallback", _train_module.LossCallback)
+except Exception:
+    pass
+
+try:
+    import train_bert as _train_bert_module
+    _mod = sys.modules.get("__main__")
+    if _mod is not None and not hasattr(_mod, "LossRecorder"):
+        setattr(_mod, "LossRecorder", _train_bert_module.LossRecorder)
+    # 兼容 BERTModelWrapper 反序列化到 __main__ 的情况
+    if _mod is not None and hasattr(_train_bert_module, "BERTModelWrapper") and not hasattr(_mod, "BERTModelWrapper"):
+        setattr(_mod, "BERTModelWrapper", _train_bert_module.BERTModelWrapper)
 except Exception:
     pass
 
@@ -113,9 +123,43 @@ def main(args):
     model_type = bundle.get("model_type", "tfidf")
     if model_type == "bert":
         # BERT模型处理
-        model = bundle["model"]
-        le = bundle["label_encoder"]
+        model = bundle.get("model")
+        le = bundle.get("label_encoder")
         ooc_detector = bundle.get("ooc_detector")
+        # 设备校正与必要时重建包装器
+        try:
+            import torch
+            if model is not None and hasattr(model, "device"):
+                desired = torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+                try:
+                    saved = str(model.device)
+                except Exception:
+                    saved = str(model.device) if model.device is not None else ""
+                if (("cuda" in saved or "mps" in saved) and desired.type == "cpu") or ("cpu" in saved and desired.type in ("cuda","mps")):
+                    model.device = desired
+        except Exception:
+            pass
+        if model is None or not hasattr(model, "predict_proba"):
+            try:
+                from train_bert import BERTModelWrapper  # type: ignore
+                from transformers import AutoTokenizer
+                import torch
+                model_dir = bundle.get("model_dir")
+                if model_dir is None or le is None:
+                    raise RuntimeError("BERT bundle 缺少 model_dir 或 label_encoder")
+                device = torch.device(
+                    "cuda" if torch.cuda.is_available() else (
+                        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+                    )
+                )
+                tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+                model = BERTModelWrapper(model_dir, tokenizer, le, device)
+            except Exception as e:
+                raise RuntimeError(f"无法重建 BERT 模型：{e}")
         
         # 读取输入样本
         outdir = args.outdir
@@ -301,6 +345,21 @@ def predict(texts, model_path=None, top_k=10):
     model_type = bundle.get("model_type", "tfidf")
     model = bundle.get("model")
     le = bundle.get("label_encoder")
+    # 若是 BERT，确保可用；必要时重建
+    if model_type == "bert" and (model is None or not hasattr(model, "predict_proba")):
+        from train_bert import BERTModelWrapper  # type: ignore
+        from transformers import AutoTokenizer
+        import torch
+        model_dir = bundle.get("model_dir")
+        if model_dir is None or le is None:
+            raise ValueError("BERT bundle 缺少 model_dir 或 label_encoder。")
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else (
+                "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+            )
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+        model = BERTModelWrapper(model_dir, tokenizer, le, device)
     if model is None or le is None:
         raise ValueError("Loaded bundle does not contain 'model' and 'label_encoder'.")
 
