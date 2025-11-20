@@ -18,9 +18,9 @@ modelsdir=./models
 # BERT 相关参数（当 ALGO=bert 时使用）
 # - 默认使用在线下载 bert-base-chinese；如需离线本地目录，请设置 INIT_HF_DIR 指向本地HF模型目录
 #   例如：`make ALGO=bert INIT_HF_DIR=./models/bert-base-chinese`（目录需包含config.json与tokenizer）
-BERT_MODEL?=bert-base-chinese
+BERT_MODEL?=chinese-macbert-base
 ALLOW_ONLINE?=0
-INIT_HF_DIR?=./models/google-bert/bert-base-chinese
+INIT_HF_DIR?=./models/hfl/chinese-macbert-base
 
 
 all: data train eval
@@ -40,10 +40,10 @@ ifeq ($(ALGO),bert)
 		$(if $(strip ${INIT_HF_DIR}),--init-hf-dir ${INIT_HF_DIR},) \
 		--train-file train.csv \
 		--eval-file eval.csv \
-		--num-train-epochs 3 \
+		--num-train-epochs 16 \
 		--train-batch-size 16 \
 		--eval-batch-size 32 \
-		--learning-rate 5e-5 \
+		--learning-rate 2e-5 \
 		--early-stopping-patience 3
 else
 	uv run src/train.py \
