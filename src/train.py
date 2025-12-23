@@ -11,8 +11,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import log_loss, accuracy_score, f1_score
+from sklearn.base import BaseEstimator, ClassifierMixin
 import joblib
 from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 warnings.filterwarnings("ignore")
 from utils import ensure_single_label, build_text, hit_at_k, fmt_sec, _flex_read_csv
@@ -171,6 +175,141 @@ class LossCallback:
         return v
 
 
+class TorchLinearModel(BaseEstimator, ClassifierMixin):
+    """A PyTorch-based linear classifier compatible with sklearn's partial_fit interface."""
+    def __init__(self, input_dim=None, num_classes=None, device="cuda", lr=1e-3, weight_decay=1e-4, class_weight=None):
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.device_name = device
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.class_weight = class_weight
+        
+        # Lazy initialization to allow sklearn cloning
+        self.model = None
+        self.criterion = None
+        self.optimizer = None
+        self.classes_ = None
+        
+    def _init_model(self):
+        if self.model is not None:
+            return
+            
+        self.device = torch.device(self.device_name if torch.cuda.is_available() else "cpu")
+        print(f"[Info] TorchLinearModel initialized on {self.device}")
+        self.model = nn.Linear(self.input_dim, self.num_classes).to(self.device)
+        
+        # Initialize weights similar to sklearn
+        nn.init.xavier_uniform_(self.model.weight)
+        nn.init.zeros_(self.model.bias)
+        
+        weight_tensor = None
+        if self.class_weight is not None:
+            weight_tensor = torch.tensor(self.class_weight, dtype=torch.float32).to(self.device)
+            
+        self.criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.classes_ = np.arange(self.num_classes)
+
+    def __sklearn_is_fitted__(self):
+        return self.model is not None
+    
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Backwards compatibility for old pickles
+        if "lr" not in self.__dict__: self.lr = 1e-3
+        if "weight_decay" not in self.__dict__: self.weight_decay = 1e-4
+        if "class_weight" not in self.__dict__: self.class_weight = None
+        if "device_name" not in self.__dict__: 
+            if "device" in self.__dict__:
+                self.device_name = str(self.device)
+            else:
+                self.device_name = "cuda"
+
+    def fit(self, X, y):
+        # Dummy fit for sklearn compatibility checks
+        return self
+        
+    def partial_fit(self, X, y, classes=None):
+        if self.model is None:
+            # If input_dim/num_classes not set, infer from data (not ideal for partial_fit but helpful)
+            if self.input_dim is None:
+                self.input_dim = X.shape[1]
+            if classes is not None and self.num_classes is None:
+                self.num_classes = len(classes)
+            self._init_model()
+            
+        self.model.train()
+        
+        # Handle sparse input
+        if issparse(X):
+            X = X.toarray()
+            
+        X_t = torch.tensor(X, dtype=torch.float32).to(self.device)
+        y_t = torch.tensor(y, dtype=torch.long).to(self.device)
+        
+        self.optimizer.zero_grad()
+        outputs = self.model(X_t)
+        loss = self.criterion(outputs, y_t)
+        loss.backward()
+        self.optimizer.step()
+        return self
+        
+    def predict_proba(self, X):
+        if self.model is None:
+             # Should not happen if fitted
+             return np.zeros((X.shape[0], self.num_classes))
+             
+        self.model.eval()
+        n_samples = X.shape[0]
+        batch_size = 2048
+        probs_list = []
+        
+        with torch.no_grad():
+            for i in range(0, n_samples, batch_size):
+                end = min(i + batch_size, n_samples)
+                X_batch = X[i:end]
+                if issparse(X_batch):
+                    X_batch = X_batch.toarray()
+                
+                X_t = torch.tensor(X_batch, dtype=torch.float32).to(self.device)
+                outputs = self.model(X_t)
+                probs = torch.softmax(outputs, dim=1)
+                probs_list.append(probs.cpu().numpy())
+                
+        if len(probs_list) > 0:
+            return np.vstack(probs_list)
+        return np.array([])
+
+    def predict(self, X):
+        probs = self.predict_proba(X)
+        return np.argmax(probs, axis=1)
+        
+    def decision_function(self, X):
+        if self.model is None:
+             return np.zeros((X.shape[0], self.num_classes))
+
+        self.model.eval()
+        n_samples = X.shape[0]
+        batch_size = 2048
+        logits_list = []
+        
+        with torch.no_grad():
+            for i in range(0, n_samples, batch_size):
+                end = min(i + batch_size, n_samples)
+                X_batch = X[i:end]
+                if issparse(X_batch):
+                    X_batch = X_batch.toarray()
+                    
+                X_t = torch.tensor(X_batch, dtype=torch.float32).to(self.device)
+                outputs = self.model(X_t)
+                logits_list.append(outputs.cpu().numpy())
+                
+        if len(logits_list) > 0:
+            return np.vstack(logits_list)
+        return np.array([])
+
+
 def main(args):
     global_start = time.time()
     print("=== 模型训练开始（使用 train.csv / eval.csv）===")
@@ -220,26 +359,13 @@ def main(args):
     y_ev_raw_f = [l for l, m in zip(y_ev_raw, ev_mask) if m]
     y_ev = le.transform(y_ev_raw_f) if len(y_ev_raw_f) > 0 else np.array([])
 
-    # 向量化器与分类器（后续用 partial_fit 显式逐 epoch 训练，便于记录 loss 曲线）
+    # 向量化器
     tfidf = TfidfVectorizer(
         analyzer=args.tfidf_analyzer,
         ngram_range=(args.ngram_min, args.ngram_max),
         max_features=args.tfidf_max_features,
         min_df=1,
         sublinear_tf=True,
-    )
-    clf = SGDClassifier(
-        loss="log_loss",
-        early_stopping=False,
-        max_iter=1,
-        tol=None,
-        random_state=42,
-        learning_rate="optimal",
-        class_weight=("balanced" if args.class_weight_balanced else None),
-        penalty=args.sgd_penalty,
-        alpha=args.sgd_alpha,
-        average=args.sgd_average,
-        n_jobs=-1,
     )
 
     # === 进度条与剩余时间估计 ===
@@ -272,9 +398,49 @@ def main(args):
         pbar.update(1)
 
     # 向量化训练集
+    print("[Info] Vectorizing training data...")
     t0 = time.time()
     X_tr_vec = tfidf.fit_transform(X_tr_text)
     _update_pbar(t0, "vectorize_train")
+
+    # 初始化分类器 (延迟到向量化之后以获取维度)
+    input_dim = X_tr_vec.shape[1]
+    num_classes = len(le.classes_)
+    
+    # 计算 class weights (如果需要)
+    class_weights = None
+    if args.class_weight_balanced:
+        from sklearn.utils.class_weight import compute_class_weight
+        classes_unique = np.unique(y_tr)
+        cw = compute_class_weight('balanced', classes=classes_unique, y=y_tr)
+        # 映射回完整类别索引
+        class_weights = np.ones(num_classes)
+        for c, w in zip(classes_unique, cw):
+            class_weights[c] = w
+
+    if args.backend == "torch":
+        clf = TorchLinearModel(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            device=args.device,
+            lr=args.lr,
+            weight_decay=args.sgd_alpha, # Reuse alpha as weight decay
+            class_weight=class_weights
+        )
+    else:
+        clf = SGDClassifier(
+            loss="log_loss",
+            early_stopping=False,
+            max_iter=1,
+            tol=None,
+            random_state=42,
+            learning_rate="optimal",
+            class_weight=("balanced" if args.class_weight_balanced else None),
+            penalty=args.sgd_penalty,
+            alpha=args.sgd_alpha,
+            average=args.sgd_average,
+            n_jobs=-1,
+        )
 
     # ========== 类别不平衡处理（修正版，含无依赖回退） ==========
     resample_method = getattr(args, "resample_method", "none")
@@ -679,5 +845,11 @@ if __name__ == "__main__":
         choices=["none", "ros", "smote", "smoteenn", "smotetomek"],
         help="不平衡处理方法：none/ros/smote/smoteenn/smotetomek",
     )
+    
+    # PyTorch 后端参数
+    parser.add_argument("--backend", type=str, default="sklearn", choices=["sklearn", "torch"], help="训练后端：sklearn(CPU) 或 torch(GPU)")
+    parser.add_argument("--device", type=str, default="cuda", help="PyTorch 设备 (cuda/cpu)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="PyTorch 学习率")
+    
     args = parser.parse_args()
     main(args)

@@ -97,7 +97,10 @@ def main(args):
     # 标签列选择：linked_items 或 extern_id（默认 linked_items）
     label_col = str(getattr(args, "label_col", "linked_items"))
 
-    # 规范标签：
+    # 清理列名首尾空格
+    df.columns = df.columns.str.strip()
+    print(df.columns)
+
     # 情况A：输入目录包含 y_train.csv -> 合并后已有 'linked_items' 工作列（数值或字符串均可）；直接使用
     # 情况B：单表/原始数据 -> 若存在 label_col，则写回工作列 'linked_items'
     df = df.copy()
@@ -199,6 +202,13 @@ def main(args):
             mapping_df = mapping_df.applymap(_fmt_no_decimal)
             mapping_df.to_csv(mapping_path, index=False, encoding='utf-8-sig')
             print(f"[kfold] 缺少上游映射，已写出最小映射：{mapping_path}")
+        # 兼容 2025.py：写出 train_eval_raw.csv 和 test_raw.csv
+        train_eval_raw = pd.concat([df_train, df_eval], axis=0).reset_index(drop=True)
+        train_eval_raw.to_csv(os.path.join(args.outdir, "train_eval_raw.csv"), index=False, encoding="utf-8-sig")
+        # kfold 场景通常没有单独 test 集，这里给一个空的占位
+        empty_test_raw = pd.DataFrame(columns=[c for c in df_train.columns if c != "linked_items"])
+        empty_test_raw.to_csv(os.path.join(args.outdir, "test_raw.csv"), index=False, encoding="utf-8-sig")
+        print(f"[kfold] 兼容 raw: train_eval_raw.csv, test_raw.csv 已写出到 {args.outdir}")
     else:
         # 兼容旧逻辑：按比例分层 + 可选 3 路切分
         rng = pd.Series(range(len(df))).sample(frac=1.0, random_state=args.seed).index  # for stable shuffle order
@@ -271,6 +281,7 @@ def main(args):
                 'item_title': ["" for _ in labels_order],
                 'extern_id': ["" for _ in labels_order],
                 'orig_linked_items': labels_order,
+                'case_id': ["" for _ in labels_order]
             })
             # 统一转换为不带小数点的字符串
             def _fmt_no_decimal(x):
@@ -289,6 +300,21 @@ def main(args):
             mapping_df = mapping_df.applymap(_fmt_no_decimal)
             mapping_df.to_csv(mapping_path, index=False, encoding='utf-8-sig')
             print(f"[ratio] 缺少上游映射，已写出最小映射：{mapping_path}")
+        # 兼容 2025.py：写出 train_eval_raw.csv 和 test_raw.csv
+        train_eval_raw = pd.concat([df_train, df_eval], axis=0).reset_index(drop=True)
+        train_eval_raw.to_csv(os.path.join(args.outdir, "train_eval_raw.csv"), index=False, encoding="utf-8-sig")
+        if len(test_idx) > 0:
+            df_test = df.iloc[sorted(test_idx)].reset_index(drop=True)
+            if "linked_items" in df_test.columns:
+                test_raw = df_test.drop(columns=["linked_items"])  # 只保留特征列，供 predict 使用
+            else:
+                test_raw = df_test.copy()
+            test_raw.to_csv(os.path.join(args.outdir, "test_raw.csv"), index=False, encoding="utf-8-sig")
+        else:
+            # 没有单独 test 的场景，写一个空占位，结构对齐
+            empty_test_raw = pd.DataFrame(columns=[c for c in df_train.columns if c != "linked_items"])
+            empty_test_raw.to_csv(os.path.join(args.outdir, "test_raw.csv"), index=False, encoding="utf-8-sig")
+        print(f"[ratio] 兼容 raw: train_eval_raw.csv, test_raw.csv 已写出到 {args.outdir}")
 
 
 if __name__ == "__main__":

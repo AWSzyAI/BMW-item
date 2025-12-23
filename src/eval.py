@@ -7,9 +7,83 @@ from sklearn.metrics import (
     accuracy_score, f1_score
 )
 from sklearn.metrics import confusion_matrix
+from sklearn.base import BaseEstimator, ClassifierMixin
 import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.sparse import issparse
+from typing import List, Dict, Any
 
 from utils import ensure_single_label, build_text, hit_at_k, eval_split
+from rerank import load_records as rerank_load_records, evaluate_records as rerank_evaluate_records
+
+
+def _evaluate_rerank_topk(records: List[Dict[str, Any]], *, use_reranked_topk: bool) -> Dict[str, Any]:
+    """Compute top-k hit metrics using either raw or reranked candidate lists."""
+    considered = 0
+    correct = 0
+    hit_counts = {1: 0, 3: 0, 5: 0, 10: 0}
+    missing_truth = 0
+    missing_candidates = 0
+    fallback_used = 0
+    mismatches: List[Dict[str, Any]] = []
+    mode_label = "reranked_top10" if use_reranked_topk else "raw_top10"
+
+    for rec in records:
+        true_label = rec.get("true", {}).get("label")
+        if true_label is None or str(true_label).strip() == "":
+            missing_truth += 1
+            continue
+        true_label = str(true_label)
+
+        candidates = rec.get("reranked_topk") if use_reranked_topk else rec.get("topk")
+        if use_reranked_topk and (not candidates):
+            fallback = rec.get("topk") or []
+            if fallback:
+                candidates = fallback
+                fallback_used += 1
+        if not candidates:
+            missing_candidates += 1
+            continue
+
+        labels = [str(cand.get("label", "")) for cand in candidates if cand is not None]
+        if not labels:
+            missing_candidates += 1
+            continue
+
+        considered += 1
+        top1 = labels[0]
+        if top1 == true_label:
+            correct += 1
+        else:
+            mismatches.append({
+                "record_id": rec.get("record_id"),
+                "true": true_label,
+                "pred": top1,
+                "mode": mode_label,
+                "text_excerpt": (rec.get("text") or "")[:120],
+            })
+        for k in hit_counts.keys():
+            if true_label in labels[:k]:
+                hit_counts[k] += 1
+
+    denom = considered if considered > 0 else 1
+    metrics = {
+        "mode": mode_label,
+        "samples": considered,
+        "correct": correct,
+        "accuracy_top1": correct / denom,
+        "hit@1": hit_counts[1] / denom,
+        "hit@3": hit_counts[3] / denom,
+        "hit@5": hit_counts[5] / denom,
+        "hit@10": hit_counts[10] / denom,
+        "dropped_missing_truth": missing_truth,
+        "dropped_missing_candidates": missing_candidates,
+        "fallback_to_raw": fallback_used,
+        "mismatches": mismatches,
+    }
+    return metrics
 
 
 def _read_split_or_combined(outdir: str, base: str) -> tuple[pd.DataFrame, str]:
@@ -168,6 +242,23 @@ def _plot_confusion_topk(y_true_ids: np.ndarray,
 
 def main(args):
 
+    # 若指定 rerank json，则直接读取并评估后返回
+    if getattr(args, "rerank_json", None):
+        records = rerank_load_records(args.rerank_json)
+        use_reranked = bool(getattr(args, "rerank_use_reranked_topk", False))
+        metrics = _evaluate_rerank_topk(records, use_reranked_topk=use_reranked)
+        tag = "Rerank-reranked" if use_reranked else "Rerank-raw"
+        print(f"[{tag}] samples={metrics['samples']} | hit@1={metrics['hit@1']:.4f} | hit@3={metrics['hit@3']:.4f} | hit@5={metrics['hit@5']:.4f} | hit@10={metrics['hit@10']:.4f}")
+        print(f"[{tag}] top1 accuracy={metrics['accuracy_top1']:.4f} ({metrics['correct']}/{metrics['samples']}) | dropped truth={metrics['dropped_missing_truth']} | dropped candidates={metrics['dropped_missing_candidates']}")
+        if getattr(args, "rerank_report", None):
+            report_dir = os.path.dirname(args.rerank_report)
+            if report_dir:
+                os.makedirs(report_dir, exist_ok=True)
+            with open(args.rerank_report, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            print(f"[Rerank] report saved -> {args.rerank_report}")
+        return
+
     # test.csv to be evaluated
     path = args.path
 
@@ -179,6 +270,37 @@ def main(args):
     
     # 读取数据（支持 X/Y 分离或单表）
     df, used_base = _read_split_or_combined(outdir, path)
+
+    # 自动识别 ID 列
+    id_col = "case_id"
+    if id_col not in df.columns:
+        # 尝试寻找替代的 ID 列
+        candidates = [c for c in df.columns if "id" in c.lower() or "no" in c.lower()]
+        if candidates:
+            # 优先匹配 "id", "ID" 等短名字
+            exact_matches = [c for c in candidates if c.lower() == "id"]
+            id_col = exact_matches[0] if exact_matches else candidates[0]
+            print(f"[Info] 未找到 case_id 列，将使用 '{id_col}' 作为 ID 列")
+        else:
+            id_col = None
+            print("[Warn] 未找到 case_id 或类似 ID 列，输出的 case_id 将为空")
+
+
+    # 简单按自然月份统计样本量，便于核对每月 N（例如 7 月）
+    if "case_submitted_date" in df.columns:
+        try:
+            df["case_submitted_date"] = pd.to_datetime(df["case_submitted_date"])
+            df["month_num"] = df["case_submitted_date"].dt.month
+            month_counts = df["month_num"].value_counts().sort_index()
+            print("\n[data] 按自然月份统计样本数：")
+            for m, c in month_counts.items():
+                print(f"  month={int(m)}: N={int(c)}")
+            if 7 in month_counts.index:
+                print(f"[data] 自然 7 月自身样本数: N={int(month_counts.loc[7])}")
+        except Exception as e:
+            print(f"[data] 按月份统计失败: {e}")
+    else:
+        print("[data] 未找到列 case_submitted_date，无法按月份统计")
     # check X,y
     # X: case_title + performed_work, (case_submitted_date)//data有什么用呢？预测未来的故障趋势？根据季节/型号发售时间来检测集中爆发的故障？
     # y: linked_items, (item_title)//目前为止item_title还没有被用起来
@@ -520,6 +642,14 @@ def main(args):
                 pred_df.to_csv(pred_out, index=False, encoding="utf-8-sig")
                 print(f"逐样本预测已保存：{pred_out}")
 
+                # 导出 bad cases (hit@10=0)
+                bad_cases = pred_df[pred_df["hit@10"] == 0].copy()
+                if not bad_cases.empty:
+                    bad_out = os.path.join(outdir, f"bad_cases_{base}.csv")
+                    bad_cases.to_csv(bad_out, index=False, encoding="utf-8-sig")
+                    print(f"Bad cases (hit@10=0) 已保存：{bad_out}")
+
+
             # 同步写一份 metrics_best_model_all_splits.csv（首行作为代表）
             head = {k: v for k, v in rows_by_thr[0].items() if not k.startswith("_")}
             results["new-open-set"] = head
@@ -732,13 +862,147 @@ def main(args):
     except Exception as e:
         print(f"[Warn] 绘制混淆矩阵失败: {e}")
 
+class TorchLinearModel(BaseEstimator, ClassifierMixin):
+    """A PyTorch-based linear classifier compatible with sklearn's partial_fit interface."""
+    def __init__(self, input_dim=None, num_classes=None, device="cuda", lr=1e-3, weight_decay=1e-4, class_weight=None):
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.device_name = device
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.class_weight = class_weight
+        
+        # Lazy initialization to allow sklearn cloning
+        self.model = None
+        self.criterion = None
+        self.optimizer = None
+        self.classes_ = None
+        
+    def _init_model(self):
+        if self.model is not None:
+            return
+            
+        self.device = torch.device(self.device_name if torch.cuda.is_available() else "cpu")
+        print(f"[Info] TorchLinearModel initialized on {self.device}")
+        self.model = nn.Linear(self.input_dim, self.num_classes).to(self.device)
+        
+        # Initialize weights similar to sklearn
+        nn.init.xavier_uniform_(self.model.weight)
+        nn.init.zeros_(self.model.bias)
+        
+        weight_tensor = None
+        if self.class_weight is not None:
+            weight_tensor = torch.tensor(self.class_weight, dtype=torch.float32).to(self.device)
+            
+        self.criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.classes_ = np.arange(self.num_classes)
+
+    def __sklearn_is_fitted__(self):
+        return self.model is not None
+    
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Backwards compatibility for old pickles
+        if "lr" not in self.__dict__: self.lr = 1e-3
+        if "weight_decay" not in self.__dict__: self.weight_decay = 1e-4
+        if "class_weight" not in self.__dict__: self.class_weight = None
+        if "device_name" not in self.__dict__: 
+            if "device" in self.__dict__:
+                self.device_name = str(self.device)
+            else:
+                self.device_name = "cuda"
+
+    def fit(self, X, y):
+        # Dummy fit for sklearn compatibility checks
+        return self
+        
+    def partial_fit(self, X, y, classes=None):
+        if self.model is None:
+            # If input_dim/num_classes not set, infer from data (not ideal for partial_fit but helpful)
+            if self.input_dim is None:
+                self.input_dim = X.shape[1]
+            if classes is not None and self.num_classes is None:
+                self.num_classes = len(classes)
+            self._init_model()
+            
+        self.model.train()
+        
+        # Handle sparse input
+        if issparse(X):
+            X = X.toarray()
+            
+        X_t = torch.tensor(X, dtype=torch.float32).to(self.device)
+        y_t = torch.tensor(y, dtype=torch.long).to(self.device)
+        
+        self.optimizer.zero_grad()
+        outputs = self.model(X_t)
+        loss = self.criterion(outputs, y_t)
+        loss.backward()
+        self.optimizer.step()
+        return self
+        
+    def predict_proba(self, X):
+        if self.model is None:
+             # Should not happen if fitted
+             return np.zeros((X.shape[0], self.num_classes))
+             
+        self.model.eval()
+        n_samples = X.shape[0]
+        batch_size = 2048
+        probs_list = []
+        
+        with torch.no_grad():
+            for i in range(0, n_samples, batch_size):
+                end = min(i + batch_size, n_samples)
+                X_batch = X[i:end]
+                if issparse(X_batch):
+                    X_batch = X_batch.toarray()
+                
+                X_t = torch.tensor(X_batch, dtype=torch.float32).to(self.device)
+                outputs = self.model(X_t)
+                probs = torch.softmax(outputs, dim=1)
+                probs_list.append(probs.cpu().numpy())
+                
+        if len(probs_list) > 0:
+            return np.vstack(probs_list)
+        return np.array([])
+
+    def predict(self, X):
+        probs = self.predict_proba(X)
+        return np.argmax(probs, axis=1)
+        
+    def decision_function(self, X):
+        if self.model is None:
+             return np.zeros((X.shape[0], self.num_classes))
+
+        self.model.eval()
+        n_samples = X.shape[0]
+        batch_size = 2048
+        logits_list = []
+        
+        with torch.no_grad():
+            for i in range(0, n_samples, batch_size):
+                end = min(i + batch_size, n_samples)
+                X_batch = X[i:end]
+                if issparse(X_batch):
+                    X_batch = X_batch.toarray()
+                    
+                X_t = torch.tensor(X_batch, dtype=torch.float32).to(self.device)
+                outputs = self.model(X_t)
+                logits_list.append(outputs.cpu().numpy())
+                
+        if len(logits_list) > 0:
+            return np.vstack(logits_list)
+        return np.array([])
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--modeldir",type=str,default="./models")
     parser.add_argument("--model", type=str, default="8.joblib",
                         help="用于评估的模型文件名，位于 outdir 下")
-    parser.add_argument("--path", type=str,default="eval.csv")
+    parser.add_argument("--path", type=str,default="test.csv")
     parser.add_argument("--outdir", type=str, default="./output/2025_up_to_month_8")
     parser.add_argument("--mode", type=str, default="new", choices=["clean", "dirty", "new"],
                         help="评估模式：clean=val+test，dirty=train+val+test，new=对传入文件整体评估")
