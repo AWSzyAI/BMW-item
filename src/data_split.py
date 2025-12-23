@@ -66,18 +66,7 @@ def _feature_cols(df: pd.DataFrame) -> List[str]:
     return cols
 
 
-def _encode_with_le(le: LabelEncoder, labels: List[str]) -> np.ndarray:
-    classes = set(le.classes_)
-    out = []
-    for lbl in labels:
-        if lbl in classes:
-            out.append(int(le.transform([lbl])[0]))
-        else:
-            out.append(-1)
-    return np.array(out, dtype=int)
-
-
-def _save_split(df_split: pd.DataFrame, name: str, outdir: Path, le: LabelEncoder) -> tuple[str, str, str]:
+def _save_split(df_split: pd.DataFrame, name: str, outdir: Path) -> tuple[str, str, str]:
     out_single = outdir / f"{name}.csv"
     df_split.to_csv(out_single, index=False, encoding="utf-8-sig")
 
@@ -86,8 +75,7 @@ def _save_split(df_split: pd.DataFrame, name: str, outdir: Path, le: LabelEncode
     X_path = outdir / f"{name}_X.csv"
     X_df.to_csv(X_path, index=False, encoding="utf-8-sig")
 
-    y_enc = _encode_with_le(le, df_split["linked_items"].astype(str).tolist())
-    y_df = pd.DataFrame({"linked_items": y_enc})
+    y_df = pd.DataFrame({"linked_items": df_split["linked_items"].astype(str).tolist()})
     Y_path = outdir / f"{name}_y.csv"
     y_df.to_csv(Y_path, index=False, encoding="utf-8-sig")
     return str(out_single), str(X_path), str(Y_path)
@@ -244,9 +232,9 @@ def split_data(args):
     le.fit(df_train["linked_items"].astype(str))
 
     # 写出分割文件
-    tr_single, tr_X, tr_y = _save_split(df_train, "train", outdir, le)
-    ev_single, ev_X, ev_y = _save_split(df_eval, "eval", outdir, le)
-    ts_single, ts_X, ts_y = _save_split(test_df.reset_index(drop=True), "test", outdir, le)
+    tr_single, tr_X, tr_y = _save_split(df_train, "train", outdir)
+    ev_single, ev_X, ev_y = _save_split(df_eval, "eval", outdir)
+    ts_single, ts_X, ts_y = _save_split(test_df.reset_index(drop=True), "test", outdir)
 
     print(f"[data_split] Saved: train({len(df_train)}) -> {tr_X}, {tr_y} | eval({len(df_eval)}) -> {ev_X}, {ev_y} | test({len(test_df)}) -> {ts_X}, {ts_y}")
     print(f"[data_split] also single: {tr_single}, {ev_single}, {ts_single}")
