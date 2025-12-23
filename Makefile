@@ -53,8 +53,7 @@ all: data train eval
 
 data:
 	@echo "设置环境变量：UV_LINK_MODE=copy"
-	@export UV_LINK_MODE=copy && uv run src/2025.py --outdir ${outdir} --month ${month} --label-col ${labelcol}
-	@export UV_LINK_MODE=copy && uv run src/5-fold.py --outdir ${outdir} --label-col ${labelcol}
+	@export UV_LINK_MODE=copy && uv run src/data_split.py --outdir ${outdir} --month ${month} --label-col ${labelcol}
 
 train:
 ifeq ($(ALGO),bert)
